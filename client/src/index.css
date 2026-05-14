@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Jobox design tokens (DESIGN_SYSTEM.md) — HSL channels.
+ * Light mode uses a warm “stage” canvas (less stark white) while preserving brand primaries.
+ */
+@layer base {
+  :root {
+    /* Arena canvas — warm gray, not #fff page flood */
+    --background: 32 14% 92%;
+    --foreground: 218 17% 17%;
+    /* Elevated surfaces — soft pearl */
+    --card: 35 30% 99%;
+    --card-foreground: 218 17% 17%;
+    --popover: 35 30% 99%;
+    --popover-foreground: 218 17% 17%;
+    --primary: 29 100% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 218 17% 17%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 32 12% 87%;
+    --muted-foreground: 218 12% 38%;
+    --accent: 28 100% 86%;
+    --accent-foreground: 218 17% 17%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 32 10% 82%;
+    /* Crisp input wells on tinted canvas */
+    --input: 0 0% 100%;
+    --ring: 29 100% 52%;
+    --radius: 1.5rem;
+  }
+
+  .dark {
+    --background: 218 22% 10%;
+    --foreground: 0 0% 98%;
+    --card: 218 16% 14%;
+    --card-foreground: 0 0% 98%;
+    --popover: 218 16% 14%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 29 100% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 218 11% 26%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 218 12% 18%;
+    --muted-foreground: 218 8% 62%;
+    --accent: 28 100% 86%;
+    --accent-foreground: 218 17% 17%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 218 12% 22%;
+    --input: 218 14% 17%;
+    --ring: 29 100% 52%;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    @apply font-sans text-foreground antialiased;
+    background-color: hsl(var(--background));
+    background-image:
+      radial-gradient(120% 90% at 50% -25%, hsl(var(--primary) / 0.18), transparent 55%),
+      radial-gradient(80% 55% at 110% 0%, hsl(218 17% 17% / 0.07), transparent 50%),
+      radial-gradient(70% 50% at -10% 100%, hsl(var(--primary) / 0.1), transparent 48%);
+    background-attachment: fixed;
+  }
+
+  .dark body {
+    background-image:
+      radial-gradient(100% 80% at 50% -20%, hsl(var(--primary) / 0.12), transparent 55%),
+      radial-gradient(70% 50% at 100% 100%, hsl(260 60% 40% / 0.12), transparent 45%),
+      radial-gradient(60% 40% at 0% 80%, hsl(var(--primary) / 0.08), transparent 50%);
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Very subtle film grain — premium broadcast feel */
+  .grain {
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+  }
+}
