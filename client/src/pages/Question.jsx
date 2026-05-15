@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import toast from 'react-hot-toast';
-import { CheckCircle2, XCircle, Eye } from 'lucide-react';
+import { CheckCircle2, XCircle, Eye, ChevronDown } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
 import { TimerBar } from '../components/TimerBar.jsx';
@@ -48,6 +48,7 @@ export default function Question({ code }) {
   const selectedAnswer = useGameStore((s) => s.selectedAnswer);
   const setSelectedAnswer = useGameStore((s) => s.setSelectedAnswer);
   const [lastFeedback, setLastFeedback] = useState(null);
+  const [mobileLeaderboardOpen, setMobileLeaderboardOpen] = useState(false);
 
   const round = session?.currentRound ?? 0;
   const q = session?.questions?.[round];
@@ -63,7 +64,17 @@ export default function Question({ code }) {
     return session.players.filter((p) => p.connected).length;
   }, [session?.players]);
 
+  const standings = useMemo(() => {
+    if (!session?.players) return [];
+    return [...session.players].sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.name.localeCompare(b.name);
+    });
+  }, [session?.players]);
+
   const myPlayer = session?.players?.find((p) => p.id === me?.id);
+  const myRank = standings.findIndex((p) => p.id === me?.id) + 1;
+  const leader = standings[0];
   const canAnswer = Boolean(myPlayer);
   const myAnswer = myPlayer?.answers?.[round];
   const lockedIdx = canAnswer
@@ -74,7 +85,10 @@ export default function Question({ code }) {
         : selectedAnswer
     : null;
 
-  useEffect(() => { setLastFeedback(null); }, [round]);
+  useEffect(() => {
+    setLastFeedback(null);
+    setMobileLeaderboardOpen(false);
+  }, [round]);
 
   const duration = session?.roundDuration ?? 20;
 
@@ -111,18 +125,18 @@ export default function Question({ code }) {
   return (
     <div className="space-y-5 animate-fadeIn">
       {/* Header row: progress + answer count */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 sm:gap-2">
           {Array.from({ length: total }).map((_, i) => (
             <span
               key={i}
               className={cn(
-                'h-2 rounded-full transition-all duration-300',
+                'h-1.5 rounded-full transition-all duration-300 sm:h-2',
                 i < round
-                  ? 'w-5 bg-primary/50'
+                  ? 'w-3 bg-primary/50 sm:w-5'
                   : i === round
-                    ? 'w-8 bg-primary shadow-glow-sm'
-                    : 'w-5 bg-muted',
+                    ? 'w-5 bg-primary shadow-glow-sm sm:w-8'
+                    : 'w-3 bg-muted sm:w-5',
               )}
             />
           ))}
@@ -135,8 +149,8 @@ export default function Question({ code }) {
       {/* Question card */}
       <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-stage-lg">
         {/* Timer + question label */}
-        <div className="flex items-center justify-between border-b border-border px-5 py-3">
-          <div>
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3 sm:px-5">
+          <div className="min-w-0">
             <span className="text-xs font-bold uppercase tracking-[0.18em] text-muted-foreground">
               Question {round + 1} of {total}
             </span>
@@ -267,7 +281,50 @@ export default function Question({ code }) {
       )}
 
       {/* Live leaderboard */}
-      <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-stage">
+      <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-stage sm:hidden">
+        <button
+          type="button"
+          className="flex w-full min-w-0 items-center justify-between gap-3 px-4 py-3.5 text-left"
+          onClick={() => setMobileLeaderboardOpen((open) => !open)}
+          aria-expanded={mobileLeaderboardOpen}
+        >
+          <div className="min-w-0">
+            <h3 className="text-sm font-bold text-foreground">Leaderboard</h3>
+            <p className="mt-0.5 truncate text-xs font-semibold text-muted-foreground">
+              {myPlayer
+                ? `You: #${myRank} · ${myPlayer.score.toLocaleString()} pts`
+                : leader
+                  ? `Leader: ${leader.name} · ${leader.score.toLocaleString()} pts`
+                  : 'No scores yet'}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <span className="rounded-full border border-border bg-muted px-2 py-1 text-xs font-semibold tabular-nums text-muted-foreground">
+              {answeredCount}/{connectedCount}
+            </span>
+            <ChevronDown
+              className={cn(
+                'size-4 text-muted-foreground transition-transform',
+                mobileLeaderboardOpen && 'rotate-180',
+              )}
+              aria-hidden
+            />
+          </div>
+        </button>
+        {mobileLeaderboardOpen && (
+          <div className="border-t border-border p-2">
+            <Leaderboard
+              players={session.players}
+              currentPlayerId={me?.id}
+              currentRound={round}
+              showAnswerStatus
+              className="max-h-72 overflow-y-auto"
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="hidden overflow-hidden rounded-2xl border border-border bg-card shadow-stage sm:block">
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <h3 className="font-bold text-foreground">Live leaderboard</h3>
           <span className="text-xs font-semibold tabular-nums text-muted-foreground">

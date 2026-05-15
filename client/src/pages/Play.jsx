@@ -47,14 +47,14 @@ export default function Play() {
   return (
     <PageShell maxWidthClass="max-w-2xl" className="space-y-5 py-4 sm:py-6">
       {/* Sticky game bar */}
-      <div className="sticky top-16 z-40 -mx-4 rounded-none border-b border-border bg-card/95 px-4 py-3 backdrop-blur-md shadow-stage sm:-mx-6 sm:rounded-xl sm:px-5">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div>
+      <div className="sticky top-16 z-40 -mx-4 max-w-none overflow-hidden rounded-none border-b border-border bg-card/95 px-4 py-3 shadow-stage backdrop-blur-md sm:-mx-6 sm:rounded-xl sm:px-5">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 sm:gap-4">
+          <div className="flex min-w-0 flex-1 items-center gap-3">
+            <div className="min-w-0">
               <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">
                 Live game
               </p>
-              <p className="text-sm font-bold text-foreground">
+              <p className="break-words text-sm font-bold text-foreground">
                 Room{' '}
                 <span className="font-mono text-primary">{session.code}</span>
                 <span className="ml-2 text-muted-foreground font-normal">
@@ -67,7 +67,7 @@ export default function Play() {
             <button
               type="button"
               className={cn(
-                'rounded-full border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-bold text-destructive transition-all hover:bg-destructive/20',
+                'shrink-0 rounded-full border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-bold text-destructive transition-all hover:bg-destructive/20',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive focus-visible:ring-offset-2',
               )}
               onClick={() => socket.emit('host:end', { code })}
