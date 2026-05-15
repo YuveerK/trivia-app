@@ -34,7 +34,14 @@ export default function Question({ code }) {
 
   const myPlayer = session?.players?.find((p) => p.id === me?.id);
   const canAnswer = Boolean(myPlayer);
-  const lockedIdx = canAnswer ? myPlayer?.answers?.[round]?.idx ?? selectedAnswer : null;
+  const myAnswer = myPlayer?.answers?.[round];
+  const lockedIdx = canAnswer
+    ? typeof myAnswer?.idx === 'number'
+      ? myAnswer.idx
+      : myAnswer
+        ? -1
+        : selectedAnswer
+    : null;
 
   useEffect(() => {
     setLastFeedback(null);
@@ -128,6 +135,9 @@ export default function Question({ code }) {
               ? `Correct! +${lastFeedback.points} pts (${lastFeedback.timeLeft?.toFixed?.(1) ?? '?'}s left)`
               : 'Incorrect — 0 pts'}
           </p>
+        )}
+        {myAnswer?.submitted && !lastFeedback && (
+          <p className="mt-4 text-sm text-muted-foreground">Answer submitted.</p>
         )}
         {!canAnswer && (
           <p className="mt-4 text-sm text-muted-foreground">

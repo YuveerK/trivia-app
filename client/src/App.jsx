@@ -35,7 +35,16 @@ function AppRoutes() {
   const reset = useGameStore((s) => s.reset);
 
   useEffect(() => {
-    socket.connect();
+    const emitReconnect = () => {
+      const raw = getPersistedSession();
+      if (!raw?.code || !raw?.me?.id || !raw?.me?.reconnectToken) return;
+      useGameStore.setState({ me: raw.me });
+      socket.emit('player:reconnect', {
+        code: raw.code,
+        playerId: raw.me.id,
+        reconnectToken: raw.me.reconnectToken,
+      });
+    };
 
     const onUpdate = ({ session }) => {
       setSession(session);
@@ -55,29 +64,29 @@ function AppRoutes() {
       toast.error(message ?? 'Something went wrong');
     };
 
+    const onReconnectFailed = ({ message }) => {
+      toast.error(message ?? 'Could not reconnect to the session');
+      reset();
+      navigate('/', { replace: true });
+    };
+
+    socket.on('connect', emitReconnect);
     socket.on('session:update', onUpdate);
     socket.on('session:ended', onEnded);
     socket.on('error', onError);
+    socket.on('reconnect:failed', onReconnectFailed);
+
+    socket.connect();
+    if (socket.connected) emitReconnect();
 
     return () => {
+      socket.off('connect', emitReconnect);
       socket.off('session:update', onUpdate);
       socket.off('session:ended', onEnded);
       socket.off('error', onError);
+      socket.off('reconnect:failed', onReconnectFailed);
     };
   }, [navigate, reset, setSession]);
-
-  useEffect(() => {
-    const raw = getPersistedSession();
-    if (!raw?.code || !raw?.me?.id) return undefined;
-
-    useGameStore.setState({ me: raw.me });
-
-    const t = setTimeout(() => {
-      socket.emit('player:reconnect', { code: raw.code, playerId: raw.me.id });
-    }, 0);
-
-    return () => clearTimeout(t);
-  }, []);
 
   return (
     <div className="relative min-h-screen">

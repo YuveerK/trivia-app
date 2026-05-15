@@ -10,7 +10,7 @@ import { cn } from '../lib/utils.js';
 function canAccessFinal(code, me, session) {
   if (!code) return false;
   const persisted = getPersistedSession();
-  if (persisted?.code === code && persisted?.me) return true;
+  if (persisted?.code === code && persisted?.me?.reconnectToken) return true;
   if (me && session?.code === code) return true;
   return false;
 }

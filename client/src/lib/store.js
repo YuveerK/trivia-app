@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import { socket } from './socket.js';
 
 const STORAGE_KEY = 'trivia_tournament_session';
 
@@ -25,23 +24,13 @@ export function getPersistedSession() {
   return readPersisted();
 }
 
-export const useGameStore = create((set, get) => ({
+export const useGameStore = create((set) => ({
   session: null,
   me: null,
   selectedAnswer: null,
   error: null,
 
-  setSession: (session) => {
-    const me = get().me;
-    if (me) {
-      set({
-        session,
-        me: { ...me, id: socket.id },
-      });
-    } else {
-      set({ session });
-    }
-  },
+  setSession: (session) => set({ session }),
 
   setMe: (me) => set({ me }),
 

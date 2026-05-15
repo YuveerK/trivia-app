@@ -120,10 +120,11 @@ io.on('connection', (socket) => {
     socket.emit('session:created', {
       session: serializeSession(session),
       you: {
-        id: socket.id,
+        id: session.hostId,
         name: session.hostName,
         isHost: true,
         isPlayer: hostParticipates,
+        reconnectToken: session.hostReconnectToken,
       },
     });
   });
@@ -148,10 +149,16 @@ io.on('connection', (socket) => {
     }
     const session = result.session;
     socket.join(session.code);
-    const me = session.players.find((p) => p.id === socket.id);
+    const me = result.player;
     socket.emit('session:joined', {
       session: serializeSession(session),
-      you: { id: socket.id, name: me?.name ?? '', isHost: false, isPlayer: true },
+      you: {
+        id: me.id,
+        name: me.name,
+        isHost: false,
+        isPlayer: true,
+        reconnectToken: me.reconnectToken,
+      },
     });
     broadcastSession(code);
   });
@@ -163,7 +170,7 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Session not found.' });
       return;
     }
-    if (session.hostId !== socket.id) {
+    if (session.hostSocketId !== socket.id) {
       socket.emit('error', { message: 'Only the host can start the game.' });
       return;
     }
@@ -182,7 +189,7 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Session not found.' });
       return;
     }
-    if (session.hostId !== socket.id) {
+    if (session.hostSocketId !== socket.id) {
       socket.emit('error', { message: 'Only the host can show results.' });
       return;
     }
@@ -200,7 +207,7 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Session not found.' });
       return;
     }
-    if (session.hostId !== socket.id) {
+    if (session.hostSocketId !== socket.id) {
       socket.emit('error', { message: 'Only the host can advance rounds.' });
       return;
     }
@@ -248,7 +255,7 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: 'Session not found.' });
       return;
     }
-    if (session.hostId !== socket.id) {
+    if (session.hostSocketId !== socket.id) {
       socket.emit('error', { message: 'Only the host can end the session.' });
       return;
     }
@@ -271,15 +278,16 @@ io.on('connection', (socket) => {
   socket.on('player:reconnect', (payload) => {
     const code = String(payload?.code ?? '').toUpperCase();
     const playerId = payload?.playerId;
-    if (!code || !playerId) {
-      socket.emit('error', { message: 'Invalid reconnect payload.' });
+    const reconnectToken = payload?.reconnectToken;
+    if (!code || !playerId || !reconnectToken) {
+      socket.emit('reconnect:failed', { message: 'Invalid reconnect payload.' });
       return;
     }
-    const result = sessions.markReconnected(code, playerId, socket.id, (s) => {
+    const result = sessions.markReconnected(code, playerId, reconnectToken, socket.id, (s) => {
       sessions.resumeRoundTimer(s, () => onRoundTimeout(code));
     });
     if (!result.ok) {
-      socket.emit('error', { message: result.error });
+      socket.emit('reconnect:failed', { message: result.error });
       return;
     }
     const session = result.session;

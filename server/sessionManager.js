@@ -1,4 +1,4 @@
-import { randomInt } from 'crypto';
+import { randomBytes, randomInt, randomUUID } from 'crypto';
 import { allPlayersAnswered, calculateScore, validateQuestionPack } from './gameLogic.js';
 import { defaultQuestions } from './defaultQuestions.js';
 
@@ -15,9 +15,17 @@ export function serializeSession(session) {
     roundTimer: _rt,
     hostAbsentTimer: _hat,
     playerGraceTimers: _pgt,
+    hostSocketId: _hsi,
+    hostReconnectToken: _hrt,
     ...rest
   } = session;
-  return JSON.parse(JSON.stringify(rest));
+  return JSON.parse(
+    JSON.stringify({
+      ...rest,
+      players: session.players.map((player) => serializePlayer(session, player)),
+      questions: serializeQuestions(session),
+    }),
+  );
 }
 
 function generateCode() {
@@ -26,6 +34,63 @@ function generateCode() {
     code += CODE_CHARS[randomInt(0, CODE_CHARS.length)];
   }
   return code;
+}
+
+function generateReconnectToken() {
+  return randomBytes(32).toString('base64url');
+}
+
+function createPlayer(name, socketId, id = randomUUID(), reconnectToken = generateReconnectToken()) {
+  return {
+    id,
+    socketId,
+    reconnectToken,
+    name: String(name).trim(),
+    score: 0,
+    answers: {},
+    connected: true,
+  };
+}
+
+function canRevealQuestion(session, index) {
+  if (session.phase === 'final') return true;
+  if (index < session.currentRound) return true;
+  return session.phase === 'results' && index === session.currentRound;
+}
+
+function serializeQuestions(session) {
+  return session.questions.map((question, index) => {
+    const showBody = index <= session.currentRound || session.phase === 'final';
+    const out = showBody
+      ? { q: question.q, options: question.options }
+      : { q: '', options: [] };
+
+    if (canRevealQuestion(session, index)) {
+      out.correct = question.correct;
+    }
+
+    return out;
+  });
+}
+
+function serializeAnswers(session, answers) {
+  return Object.fromEntries(
+    Object.entries(answers).map(([round, answer]) => {
+      const roundIndex = Number(round);
+      if (canRevealQuestion(session, roundIndex)) return [round, answer];
+      return [round, { submitted: true }];
+    }),
+  );
+}
+
+function serializePlayer(session, player) {
+  return {
+    id: player.id,
+    name: player.name,
+    score: player.score,
+    answers: serializeAnswers(session, player.answers),
+    connected: player.connected,
+  };
 }
 
 export class SessionManager {
@@ -85,22 +150,19 @@ export class SessionManager {
       }
     }
 
+    const hostId = randomUUID();
+    const hostReconnectToken = generateReconnectToken();
+
     /** @type {any} */
     const session = {
       code,
-      hostId: hostSocketId,
+      hostId,
+      hostSocketId,
+      hostReconnectToken,
       hostName: String(hostName).trim(),
       hostParticipates,
       players: hostParticipates
-        ? [
-            {
-              id: hostSocketId,
-              name: String(hostName).trim(),
-              score: 0,
-              answers: {},
-              connected: true,
-            },
-          ]
+        ? [createPlayer(hostName, hostSocketId, hostId, hostReconnectToken)]
         : [],
       questions,
       currentRound: -1,
@@ -142,14 +204,9 @@ export class SessionManager {
     if (session.players.some((p) => p.name.toLowerCase() === lower)) {
       return { ok: false, error: 'That name is already taken in this session.' };
     }
-    session.players.push({
-      id: socketId,
-      name: trimmed,
-      score: 0,
-      answers: {},
-      connected: true,
-    });
-    return { ok: true, session };
+    const player = createPlayer(trimmed, socketId);
+    session.players.push(player);
+    return { ok: true, session, player };
   }
 
   /**
@@ -160,26 +217,29 @@ export class SessionManager {
   removePlayer(code, socketId) {
     const session = this.getSession(code);
     if (!session) return {};
+    const isHostSocket = session.hostSocketId === socketId;
 
-    if (session.hostId === socketId && !session.players.some((p) => p.id === socketId)) {
+    if (isHostSocket && !session.players.some((p) => p.socketId === socketId)) {
       this.cleanupSession(code, 'The host left the session.');
       return { ended: true, reason: 'The host left the session.' };
     }
 
-    const idx = session.players.findIndex((p) => p.id === socketId);
+    const idx = session.players.findIndex((p) => p.socketId === socketId);
     if (idx === -1) return { session };
 
-    session.players.splice(idx, 1);
-    this.clearPlayerGraceTimer(session, socketId);
+    const [removedPlayer] = session.players.splice(idx, 1);
+    this.clearPlayerGraceTimer(session, removedPlayer.id);
 
     if (session.players.length === 0) {
       this.cleanupSession(code);
       return { ended: true, reason: 'Everyone left the session.' };
     }
 
-    if (session.hostId === socketId) {
+    if (isHostSocket) {
       const next = session.players.find((p) => p.connected) ?? session.players[0];
       session.hostId = next.id;
+      session.hostSocketId = next.socketId;
+      session.hostReconnectToken = next.reconnectToken;
       session.hostName = next.name;
       session.hostParticipates = true;
       session.hostDisconnected = false;
@@ -193,11 +253,11 @@ export class SessionManager {
     return { session };
   }
 
-  /** @param {any} session @param {string} socketId */
-  clearPlayerGraceTimer(session, socketId) {
-    const t = session.playerGraceTimers.get(socketId);
+  /** @param {any} session @param {string} playerId */
+  clearPlayerGraceTimer(session, playerId) {
+    const t = session.playerGraceTimers.get(playerId);
     if (t) clearTimeout(t);
-    session.playerGraceTimers.delete(socketId);
+    session.playerGraceTimers.delete(playerId);
   }
 
   /**
@@ -231,24 +291,25 @@ export class SessionManager {
    */
   markDisconnected(socketId, onHostAbsentEnd) {
     for (const [code, session] of this.sessions) {
-      const player = session.players.find((p) => p.id === socketId);
-      if (!player && session.hostId !== socketId) continue;
+      const player = session.players.find((p) => p.socketId === socketId);
+      const isHostSocket = session.hostSocketId === socketId;
+      if (!player && !isHostSocket) continue;
 
       if (player) {
         player.connected = false;
-        this.clearPlayerGraceTimer(session, socketId);
+        this.clearPlayerGraceTimer(session, player.id);
 
         const grace = setTimeout(() => {
-          session.playerGraceTimers.delete(socketId);
+          session.playerGraceTimers.delete(player.id);
           if (session.phase === 'lobby') {
             const out = this.removePlayer(code, socketId);
             if (this.onAfterPlayerChange) this.onAfterPlayerChange(code, out);
           }
         }, PLAYER_GRACE_MS);
-        session.playerGraceTimers.set(socketId, grace);
+        session.playerGraceTimers.set(player.id, grace);
       }
 
-      if (session.hostId === socketId) {
+      if (isHostSocket) {
         session.hostDisconnected = true;
         if (session.phase === 'question' && session.roundStart != null) {
           const elapsed = Date.now() - session.roundStart;
@@ -262,8 +323,7 @@ export class SessionManager {
         if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
         session.hostAbsentTimer = setTimeout(() => {
           session.hostAbsentTimer = null;
-          const host = session.players.find((p) => p.id === session.hostId);
-          if (host && !host.connected) {
+          if (session.hostDisconnected) {
             onHostAbsentEnd(code, { reason: 'Host did not reconnect. Session ended.' });
           }
         }, HOST_ABSENT_MS);
@@ -276,26 +336,33 @@ export class SessionManager {
 
   /**
    * @param {string} code
-   * @param {string} oldPlayerId
+   * @param {string} playerId
+   * @param {string} reconnectToken
    * @param {string} newSocketId
    * @param {(session: any) => void} [onResumeRound]
    */
-  markReconnected(code, oldPlayerId, newSocketId, onResumeRound) {
+  markReconnected(code, playerId, reconnectToken, newSocketId, onResumeRound) {
     const session = this.getSession(code);
     if (!session) return { ok: false, error: 'Session not found.' };
-    const player = session.players.find((p) => p.id === oldPlayerId);
-    const isHost = session.hostId === oldPlayerId;
+    const player = session.players.find((p) => p.id === playerId);
+    const isHost = session.hostId === playerId;
     if (!player && !isHost) return { ok: false, error: 'Player not found in session.' };
 
-    this.clearPlayerGraceTimer(session, oldPlayerId);
+    const playerTokenOk = player?.reconnectToken === reconnectToken;
+    const hostTokenOk = isHost && session.hostReconnectToken === reconnectToken;
+    if (!playerTokenOk && !hostTokenOk) {
+      return { ok: false, error: 'Invalid reconnect credentials.' };
+    }
+
+    if (player) this.clearPlayerGraceTimer(session, player.id);
 
     if (player) {
-      player.id = newSocketId;
+      player.socketId = newSocketId;
       player.connected = true;
     }
 
     if (isHost) {
-      session.hostId = newSocketId;
+      session.hostSocketId = newSocketId;
       session.hostDisconnected = false;
       if (session.hostAbsentTimer) {
         clearTimeout(session.hostAbsentTimer);
@@ -362,7 +429,7 @@ export class SessionManager {
     if (roundIndex !== session.currentRound) {
       return { ok: false, error: 'Wrong round.' };
     }
-    const player = session.players.find((p) => p.id === socketId);
+    const player = session.players.find((p) => p.socketId === socketId);
     if (!player) return { ok: false, error: 'Player not in session.' };
     if (player.answers[roundIndex]) {
       return { ok: false, error: 'You already answered this round.' };
