@@ -15,13 +15,13 @@ export function ThemeToggle({ className }) {
       type="button"
       onClick={toggle}
       className={cn(
-        'inline-flex h-10 w-10 items-center justify-center rounded-full border border-border bg-card/95 text-foreground shadow-stage backdrop-blur-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+        'inline-flex size-10 items-center justify-center rounded-full border border-border bg-card/90 text-muted-foreground shadow-stage backdrop-blur-md transition-all hover:bg-muted hover:text-foreground hover:shadow-stage-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
         className,
       )}
       aria-label="Toggle color theme"
     >
-      <Sun className="size-[18px] dark:hidden" aria-hidden />
-      <Moon className="hidden size-[18px] dark:inline" aria-hidden />
+      <Sun className="size-4 dark:hidden" aria-hidden />
+      <Moon className="hidden size-4 dark:inline" aria-hidden />
     </button>
   );
 }

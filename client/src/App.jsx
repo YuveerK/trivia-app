@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { Toaster, toast } from 'react-hot-toast';
+import { Zap } from 'lucide-react';
 import { ThemeToggle } from './components/ThemeToggle.jsx';
 import Home from './pages/Home.jsx';
 import Lobby from './pages/Lobby.jsx';
@@ -11,15 +12,15 @@ import { getPersistedSession, persistSession, useGameStore } from './lib/store.j
 
 const toastOptions = {
   duration: 4000,
-  className: 'font-sans text-sm',
+  className: 'font-sans text-sm font-medium',
   style: {
     background: 'hsl(var(--popover))',
     color: 'hsl(var(--popover-foreground))',
     border: '1px solid hsl(var(--border))',
-    borderRadius: 'var(--radius)',
-    boxShadow:
-      '0 10px 15px -3px rgb(0 0 0 / 0.08), 0 4px 6px -4px rgb(0 0 0 / 0.08)',
+    borderRadius: '0.75rem',
+    boxShadow: '0 20px 40px -10px rgba(0,0,0,0.25), 0 0 0 1px hsl(var(--border))',
     maxWidth: '22rem',
+    padding: '12px 16px',
   },
   success: {
     iconTheme: { primary: 'hsl(var(--primary))', secondary: 'hsl(var(--popover))' },
@@ -90,16 +91,28 @@ function AppRoutes() {
 
   return (
     <div className="relative min-h-screen">
-      <div
-        className="pointer-events-none fixed inset-0 z-0 grain opacity-[0.65] dark:opacity-40"
-        aria-hidden
-      />
-      <div className="relative z-10">
-        <div className="pointer-events-none fixed right-4 top-4 z-50 sm:right-6 sm:top-6">
-          <div className="pointer-events-auto">
-            <ThemeToggle />
-          </div>
-        </div>
+      {/* Grain texture overlay */}
+      <div className="pointer-events-none fixed inset-0 z-0 grain opacity-60 dark:opacity-40" aria-hidden />
+
+      {/* Global header */}
+      <header className="fixed left-0 right-0 top-0 z-50 flex items-center justify-between px-4 py-3 sm:px-6">
+        <a
+          href="/"
+          className="group inline-flex items-center gap-2 rounded-full border border-border/60 bg-card/80 px-3 py-2 shadow-stage backdrop-blur-md transition-all hover:border-primary/40 hover:shadow-glow-sm"
+          aria-label="Home"
+        >
+          <span className="flex size-6 items-center justify-center rounded-full bg-primary shadow-glow-sm">
+            <Zap className="size-3.5 fill-white text-white" aria-hidden />
+          </span>
+          <span className="text-sm font-bold tracking-tight text-foreground">
+            Trivia<span className="text-primary">Live</span>
+          </span>
+        </a>
+        <ThemeToggle />
+      </header>
+
+      {/* Page content — padded for fixed header */}
+      <div className="relative z-10 pt-16">
         <Toaster position="top-center" toastOptions={toastOptions} />
         <Routes>
           <Route path="/" element={<Home />} />
