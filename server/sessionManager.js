@@ -52,6 +52,28 @@ function createPlayer(name, socketId, id = randomUUID(), reconnectToken = genera
   };
 }
 
+function shuffleQuestionOptions(question) {
+  const options = question.options.map((option, index) => ({
+    option,
+    originalIndex: index,
+  }));
+
+  for (let i = options.length - 1; i > 0; i--) {
+    const j = randomInt(0, i + 1);
+    [options[i], options[j]] = [options[j], options[i]];
+  }
+
+  return {
+    ...question,
+    options: options.map((entry) => entry.option),
+    correct: options.findIndex((entry) => entry.originalIndex === question.correct),
+  };
+}
+
+function prepareQuestions(questions) {
+  return questions.map((question) => shuffleQuestionOptions(question));
+}
+
 function canRevealQuestion(session, index) {
   if (session.phase === 'final') return true;
   if (index < session.currentRound) return true;
@@ -134,11 +156,11 @@ export class SessionManager {
       }
       const v = validateQuestionPack(parsed);
       if (!v.valid) return { ok: false, error: v.error };
-      questions = parsed;
+      questions = prepareQuestions(parsed);
     } else {
       const v = validateQuestionPack(defaultQuestions);
       if (!v.valid) return { ok: false, error: v.error };
-      questions = defaultQuestions;
+      questions = prepareQuestions(defaultQuestions);
     }
 
     let code = '';
