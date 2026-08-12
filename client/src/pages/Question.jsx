@@ -5,7 +5,7 @@ import { Button } from '../components/Button.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
 import { TimerBar } from '../components/TimerBar.jsx';
 import { projectedPoints } from '../lib/scoring.js';
-import { socket } from '../lib/socket.js';
+import { emitWithAck } from '../lib/socket.js';
 import { useGameStore } from '../lib/store.js';
 import { cn } from '../lib/utils.js';
 
@@ -47,7 +47,10 @@ export default function Question({ code }) {
   const me = useGameStore((s) => s.me);
   const selectedAnswer = useGameStore((s) => s.selectedAnswer);
   const setSelectedAnswer = useGameStore((s) => s.setSelectedAnswer);
+  const connectionStatus = useGameStore((s) => s.connectionStatus);
   const [lastFeedback, setLastFeedback] = useState(null);
+  const [pendingAnswer, setPendingAnswer] = useState(false);
+  const [pendingHostAction, setPendingHostAction] = useState(false);
   const [mobileLeaderboardOpen, setMobileLeaderboardOpen] = useState(false);
 
   const round = session?.currentRound ?? 0;
@@ -87,34 +90,54 @@ export default function Question({ code }) {
 
   useEffect(() => {
     setLastFeedback(null);
+    setPendingAnswer(false);
     setMobileLeaderboardOpen(false);
   }, [round]);
 
+  useEffect(() => {
+    if (connectionStatus === 'connected' && !pendingAnswer && selectedAnswer != null && !myAnswer) {
+      setSelectedAnswer(null);
+    }
+  }, [connectionStatus, myAnswer, pendingAnswer, selectedAnswer, setSelectedAnswer]);
+
   const duration = session?.roundDuration ?? 20;
 
-  const handlePick = (idx) => {
-    if (lockedIdx != null) return;
+  const handlePick = async (idx) => {
+    if (lockedIdx != null || pendingAnswer || session.paused || connectionStatus !== 'connected') return;
     setSelectedAnswer(idx);
-    const onRecorded = (payload) => {
-      socket.off('answer:recorded', onRecorded);
-      socket.off('error', onErr);
-      setLastFeedback(payload);
-    };
-    const onErr = (payload) => {
-      socket.off('answer:recorded', onRecorded);
-      socket.off('error', onErr);
-      setSelectedAnswer(null);
-      toast.error(payload?.message ?? 'Could not submit answer');
-    };
-    socket.once('answer:recorded', onRecorded);
-    socket.once('error', onErr);
-    socket.emit('player:answer', { code, roundIndex: round, optionIndex: idx });
+    setPendingAnswer(true);
+    try {
+      await emitWithAck('player:answer', { code, roundIndex: round, optionIndex: idx });
+      setLastFeedback({ accepted: true });
+    } catch (error) {
+      let recovered = false;
+      try {
+        const synced = await emitWithAck('session:sync', { code }, { attempts: 1, timeout: 3_000 });
+        useGameStore.getState().setSession(synced.session);
+        const recorded = synced.session.players
+          ?.find((player) => player.id === me?.id)
+          ?.answers?.[round];
+        if (recorded) {
+          recovered = true;
+          setLastFeedback({ accepted: true });
+        } else {
+          setSelectedAnswer(null);
+        }
+      } catch {
+        setSelectedAnswer(null);
+      }
+      if (!recovered) toast.error(error.message ?? 'Could not submit answer');
+    } finally {
+      setPendingAnswer(false);
+    }
   };
 
-  const showResults = () => {
-    const onErr = (payload) => { socket.off('error', onErr); toast.error(payload?.message ?? 'Could not show results'); };
-    socket.once('error', onErr);
-    socket.emit('host:showResults', { code });
+  const showResults = async () => {
+    if (pendingHostAction) return;
+    setPendingHostAction(true);
+    try { await emitWithAck('host:showResults', { code }); }
+    catch (error) { toast.error(error.message ?? 'Could not show results'); }
+    finally { setPendingHostAction(false); }
   };
 
   if (!q) return null;
@@ -155,7 +178,7 @@ export default function Question({ code }) {
               Question {round + 1} of {total}
             </span>
           </div>
-          <LivePoints roundStart={session.roundStart} durationSec={duration} />
+          <LivePoints remainingMs={session.remainingMs} durationSec={duration} paused={session.paused} />
         </div>
 
         {/* Question text + timer */}
@@ -166,7 +189,7 @@ export default function Question({ code }) {
             </h2>
           </div>
           <div className="shrink-0 self-center sm:self-start">
-            <TimerBar roundStart={session.roundStart} durationSec={duration} />
+            <TimerBar remainingMs={session.remainingMs} durationSec={duration} paused={session.paused} />
           </div>
         </div>
 
@@ -175,10 +198,11 @@ export default function Question({ code }) {
           {q.options.map((opt, idx) => {
             const style = ANSWER_STYLES[idx % ANSWER_STYLES.length];
             const isSelected = lockedIdx === idx;
-            const isCorrect = isSelected && lastFeedback?.correct === true;
-            const isWrong = isSelected && lastFeedback?.correct === false;
+            const isCorrect = false;
+            const isWrong = false;
             const isLockedOut = isAnswered && !isSelected;
-            const disabled = !canAnswer || isAnswered;
+            const disabled =
+              !canAnswer || isAnswered || pendingAnswer || session.paused || connectionStatus !== 'connected';
 
             return (
               <button
@@ -234,17 +258,14 @@ export default function Question({ code }) {
           <div
             className={cn(
               'animate-slideDown flex items-center gap-3 border-t px-5 py-3 text-sm font-semibold',
-              lastFeedback.correct
-                ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900/40 dark:bg-emerald-950/40 dark:text-emerald-200'
-                : 'border-red-200 bg-red-50 text-red-800 dark:border-red-900/40 dark:bg-red-950/40 dark:text-red-200',
+              'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900/40 dark:bg-blue-950/40 dark:text-blue-200',
             )}
           >
-            {lastFeedback.correct ? (
+            {lastFeedback.accepted ? (
               <>
                 <CheckCircle2 className="size-5 shrink-0" aria-hidden />
                 <span>
-                  Correct! +<strong className="animate-scorePop inline-block">{lastFeedback.points}</strong> pts
-                  <span className="ml-1 font-normal opacity-70">({lastFeedback.timeLeft?.toFixed?.(1) ?? '?'}s left)</span>
+                  Answer securely recorded. The result will be revealed when the round ends.
                 </span>
               </>
             ) : (
@@ -274,7 +295,12 @@ export default function Question({ code }) {
       </div>
 
       {isHost && (
-        <Button variant="outline" onClick={showResults} className="gap-2">
+        <Button
+          variant="outline"
+          onClick={showResults}
+          className="gap-2"
+          disabled={pendingHostAction || connectionStatus !== 'connected'}
+        >
           <Eye className="size-4" aria-hidden />
           Reveal answers
         </Button>
@@ -344,19 +370,20 @@ export default function Question({ code }) {
   );
 }
 
-function LivePoints({ roundStart, durationSec }) {
+function LivePoints({ remainingMs, durationSec, paused }) {
   const [tick, setTick] = useState(0);
+  const [startedAt, setStartedAt] = useState(() => performance.now());
 
   useEffect(() => {
-    if (roundStart == null) return undefined;
+    setStartedAt(performance.now());
+    setTick(0);
+    if (paused) return undefined;
     const id = setInterval(() => setTick((t) => t + 1), 100);
     return () => clearInterval(id);
-  }, [roundStart]);
+  }, [remainingMs, paused]);
 
-  if (roundStart == null) return null;
-
-  const elapsed = (Date.now() - roundStart) / 1000;
-  const timeLeft = Math.max(0, durationSec - elapsed);
+  const elapsed = paused ? 0 : (performance.now() - startedAt) / 1000;
+  const timeLeft = Math.max(0, remainingMs / 1000 - elapsed);
   const pts = projectedPoints(timeLeft, durationSec);
 
   void tick;

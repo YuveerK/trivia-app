@@ -1,11 +1,17 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Navigate, useNavigate, useParams } from 'react-router-dom';
 import { Loader2, RotateCcw, Star } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
 import { PageShell } from '../components/PageShell.jsx';
 import { avatarGradient } from '../components/PlayerBadge.jsx';
-import { getPersistedSession, useGameStore } from '../lib/store.js';
+import {
+  clearPendingLeave,
+  getPersistedSession,
+  queuePendingLeave,
+  useGameStore,
+} from '../lib/store.js';
 import { cn } from '../lib/utils.js';
+import { emitWithAck, socket } from '../lib/socket.js';
 
 function canAccessFinal(code, me, session) {
   if (!code) return false;
@@ -51,6 +57,7 @@ export default function Final() {
   const session = useGameStore((s) => s.session);
   const me = useGameStore((s) => s.me);
   const reset = useGameStore((s) => s.reset);
+  const [leaving, setLeaving] = useState(false);
 
   const rows = useMemo(() => {
     if (!session?.players) return [];
@@ -85,7 +92,23 @@ export default function Final() {
     return <Navigate to={`/play/${code}`} replace />;
   }
 
-  const newGame = () => { reset(); navigate('/'); };
+  const newGame = async () => {
+    if (leaving) return;
+    setLeaving(true);
+    queuePendingLeave(code, me);
+    try {
+      if (socket.connected) {
+        await emitWithAck('player:leave', { code }, { attempts: 1, timeout: 3_000 });
+        clearPendingLeave();
+      }
+    } catch {
+      // Disconnect cleanup is the fallback; local state must still be cleared.
+    } finally {
+      reset();
+      navigate('/');
+      setLeaving(false);
+    }
+  };
   const top3 = rows.slice(0, 3);
   const rest = rows.slice(3);
 
@@ -223,7 +246,7 @@ export default function Final() {
         </ul>
       </div>
 
-      <Button onClick={newGame} className="gap-2 text-base">
+      <Button onClick={newGame} className="gap-2 text-base" disabled={leaving}>
         <RotateCcw className="size-5" aria-hidden />
         Play again
       </Button>

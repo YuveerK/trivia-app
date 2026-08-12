@@ -33,7 +33,7 @@ export function validateQuestionPack(questions) {
       return { valid: false, error: `Question ${i + 1} is invalid.` };
     }
     const q = item.q;
-    if (typeof q !== 'string' || q.length < 1 || q.length > 300) {
+    if (typeof q !== 'string' || q.trim().length < 1 || q.length > 300) {
       return {
         valid: false,
         error: `Question ${i + 1}: text must be a string between 1 and 300 characters.`,
@@ -47,10 +47,14 @@ export function validateQuestionPack(questions) {
       };
     }
     for (let j = 0; j < options.length; j++) {
-      if (typeof options[j] !== 'string' || options[j].trim() === '') {
+      if (
+        typeof options[j] !== 'string' ||
+        options[j].trim() === '' ||
+        options[j].length > 200
+      ) {
         return {
           valid: false,
-          error: `Question ${i + 1}: option ${j + 1} must be a non-empty string.`,
+          error: `Question ${i + 1}: option ${j + 1} must contain 1 to 200 characters.`,
         };
       }
     }
@@ -71,13 +75,15 @@ export function validateQuestionPack(questions) {
 }
 
 /**
- * All currently connected players must have submitted for the current round.
- * @param {{ phase: string, currentRound: number, players: Array<{ connected: boolean, answers: Record<number, unknown> }> }} session
+ * Every player who has not explicitly left (or exhausted their reconnect grace
+ * period) must have submitted for the current round. A transient disconnect
+ * must not make a round finish underneath that player.
+ * @param {{ phase: string, currentRound: number, players: Array<{ departed: boolean, answers: Record<number, unknown> }> }} session
  */
 export function allPlayersAnswered(session) {
   if (session.phase !== 'question') return false;
   const r = session.currentRound;
-  const active = session.players.filter((p) => p.connected);
+  const active = session.players.filter((p) => !p.departed);
   if (active.length === 0) return false;
   return active.every((p) => p.answers[r] != null);
 }
