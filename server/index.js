@@ -1,19 +1,18 @@
 import 'dotenv/config';
 import http from 'http';
+import { pathToFileURL } from 'url';
 import express from 'express';
 import cors from 'cors';
 import { Server } from 'socket.io';
-import { SessionManager, serializeSession } from './sessionManager.js';
+import { SessionManager, serializePlayer, serializeSession } from './sessionManager.js';
 import { allPlayersAnswered } from './gameLogic.js';
 
-const PORT = Number(process.env.PORT) || 3001;
+const DEFAULT_PORT = Number(process.env.PORT) || 3001;
+const MAX_SOCKET_MESSAGE_BYTES = 512 * 1024;
 const CLIENT_URLS = (process.env.CLIENT_URLS || process.env.CLIENT_URL || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
-
-const app = express();
-app.use(express.json({ limit: '512kb' }));
 
 const allowedOrigins = new Set([
   ...CLIENT_URLS,
@@ -24,287 +23,445 @@ const allowedOrigins = new Set([
 ]);
 
 function allowOrigin(origin, callback) {
-  if (!origin) {
-    callback(null, true);
-    return;
-  }
+  if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+  return callback(new Error('Origin is not allowed by CORS.'));
+}
 
-  if (allowedOrigins.has(origin)) {
-    callback(null, true);
-    return;
-  }
+function requestKey(event, payload) {
+  const clientId = typeof payload?.clientId === 'string' ? payload.clientId : '';
+  const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
+  if (!clientId || !requestId || clientId.length > 100 || requestId.length > 100) return null;
+  return `${clientId}:${event}:${requestId}`;
+}
 
-  try {
-    const url = new URL(origin);
-    if (url.protocol === 'http:' && ['4173', '5173'].includes(url.port)) {
-      callback(null, true);
-      return;
+function allowEvent(socket, event) {
+    const buckets = socket.data.rateBuckets ?? (socket.data.rateBuckets = new Map());
+    const now = Date.now();
+    const limit = event === 'player:answer' ? 12 : event === 'session:sync' ? 15 : 8;
+    const bucket = buckets.get(event);
+    if (!bucket || now - bucket.startedAt >= 10_000) {
+      buckets.set(event, { startedAt: now, count: 1 });
+      return true;
     }
-  } catch {
-    // Fall through to the CORS rejection below.
-  }
-
-  callback(new Error(`Origin ${origin} is not allowed by CORS.`));
+    bucket.count += 1;
+    return bucket.count <= limit;
 }
 
-app.use(
-  cors({
-    origin: allowOrigin,
-    credentials: true,
-  }),
-);
+export function createTriviaServer({ sessions = new SessionManager() } = {}) {
+  const app = express();
+  app.use(express.json({ limit: '64kb' }));
+  app.use(cors({ origin: allowOrigin, credentials: true }));
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: allowOrigin,
-    credentials: true,
-  },
-});
+  const server = http.createServer(app);
+  const connectionBuckets = new Map();
+  const configuredMaxConnections = Number(process.env.MAX_CONNECTIONS);
+  const maxConnections = Number.isSafeInteger(configuredMaxConnections) && configuredMaxConnections > 0
+    ? configuredMaxConnections
+    : 5_000;
+  let io;
+  io = new Server(server, {
+    cors: { origin: allowOrigin, credentials: true },
+    maxHttpBufferSize: MAX_SOCKET_MESSAGE_BYTES,
+    pingInterval: 25_000,
+    pingTimeout: 20_000,
+    allowRequest: (request, callback) => {
+      if ((io?.engine?.clientsCount ?? 0) >= maxConnections) {
+        callback('Server connection capacity reached.', false);
+        return;
+      }
+      const trustProxy = process.env.TRUST_PROXY === 'true';
+      const forwarded = request.headers['x-forwarded-for'];
+      const address = trustProxy && forwarded
+        ? String(forwarded).split(',')[0].trim()
+        : request.socket.remoteAddress ?? 'unknown';
+      const now = Date.now();
+      const bucket = connectionBuckets.get(address);
+      if (!bucket || now - bucket.startedAt >= 60_000) {
+        connectionBuckets.set(address, { startedAt: now, count: 1 });
+        if (connectionBuckets.size > 10_000) {
+          for (const [key, item] of connectionBuckets) {
+            if (now - item.startedAt >= 60_000) connectionBuckets.delete(key);
+          }
+        }
+        callback(null, true);
+        return;
+      }
+      bucket.count += 1;
+      callback(bucket.count > 300 ? 'Too many connection attempts.' : null, bucket.count <= 300);
+    },
+  });
+  const inFlightRequests = new Map();
 
-const sessions = new SessionManager();
-sessions.onAfterPlayerChange = (code, out) => {
-  if (out.ended) {
-    io.to(code).emit('session:ended', { reason: out.reason ?? 'Session ended.' });
-    return;
-  }
-  if (out.session) broadcastSession(code);
-};
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', activeSessions: sessions.getActiveCount() });
-});
-
-function broadcastSession(code) {
-  const session = sessions.getSession(code);
-  if (!session) return;
-  io.to(code).emit('session:update', { session: serializeSession(session) });
-}
-
-function endSession(code, reason) {
-  io.to(code).emit('session:ended', { reason });
-  sessions.cleanupSession(code, reason);
-}
-
-function goToResults(code) {
-  const session = sessions.getSession(code);
-  if (!session || session.phase !== 'question') return;
-  sessions.transitionToResults(session);
-  broadcastSession(code);
-}
-
-function onRoundTimeout(code) {
-  goToResults(code);
-}
-
-io.on('connection', (socket) => {
-  socket.on('host:create', (payload) => {
-    const name = payload?.name;
-    if (!name || !String(name).trim()) {
-      socket.emit('error', { message: 'Name is required.' });
-      return;
-    }
-    const hostParticipates = payload?.hostParticipates !== false;
-    const result = sessions.createSession(
-      String(name).trim(),
-      socket.id,
-      payload?.questions,
-      hostParticipates,
-    );
-    if (!result.ok) {
-      socket.emit('error', { message: result.error });
-      return;
-    }
-    const { session } = result;
-    socket.join(session.code);
-    socket.emit('session:created', {
-      session: serializeSession(session),
-      you: {
-        id: session.hostId,
-        name: session.hostName,
-        isHost: true,
-        isPlayer: hostParticipates,
-        reconnectToken: session.hostReconnectToken,
-      },
+  app.get('/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      activeSessions: sessions.getActiveCount(),
+      connectedSockets: io.engine.clientsCount,
+      uptimeSeconds: Math.round(process.uptime()),
     });
   });
 
-  socket.on('player:join', (payload) => {
-    const code = String(payload?.code ?? '')
-      .toUpperCase()
-      .trim();
-    const name = payload?.name;
-    if (!/^[A-Z0-9]{4}$/.test(code)) {
-      socket.emit('error', { message: 'Enter a valid 4-character code.' });
-      return;
-    }
-    if (!name || !String(name).trim()) {
-      socket.emit('error', { message: 'Name is required.' });
-      return;
-    }
-    const result = sessions.addPlayer(code, socket.id, String(name).trim());
-    if (!result.ok) {
-      socket.emit('error', { message: result.error });
-      return;
-    }
-    const session = result.session;
-    socket.join(session.code);
-    const me = result.player;
-    socket.emit('session:joined', {
-      session: serializeSession(session),
-      you: {
-        id: me.id,
-        name: me.name,
-        isHost: false,
-        isPlayer: true,
-        reconnectToken: me.reconnectToken,
-      },
-    });
-    broadcastSession(code);
-  });
-
-  socket.on('host:start', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const session = sessions.getSession(code);
-    if (!session) {
-      socket.emit('error', { message: 'Session not found.' });
-      return;
-    }
-    if (session.hostSocketId !== socket.id) {
-      socket.emit('error', { message: 'Only the host can start the game.' });
-      return;
-    }
-    const started = sessions.startGame(session, () => onRoundTimeout(code));
-    if (!started.ok) {
-      socket.emit('error', { message: started.error });
-      return;
-    }
-    broadcastSession(code);
-  });
-
-  socket.on('host:showResults', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const session = sessions.getSession(code);
-    if (!session) {
-      socket.emit('error', { message: 'Session not found.' });
-      return;
-    }
-    if (session.hostSocketId !== socket.id) {
-      socket.emit('error', { message: 'Only the host can show results.' });
-      return;
-    }
-    if (session.phase !== 'question') {
-      socket.emit('error', { message: 'Not in question phase.' });
-      return;
-    }
-    goToResults(code);
-  });
-
-  socket.on('host:nextRound', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const session = sessions.getSession(code);
-    if (!session) {
-      socket.emit('error', { message: 'Session not found.' });
-      return;
-    }
-    if (session.hostSocketId !== socket.id) {
-      socket.emit('error', { message: 'Only the host can advance rounds.' });
-      return;
-    }
-    const next = sessions.nextRound(session, () => onRoundTimeout(code));
-    if (!next.ok) {
-      socket.emit('error', { message: next.error });
-      return;
-    }
-    broadcastSession(code);
-  });
-
-  socket.on('player:answer', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const session = sessions.getSession(code);
-    if (!session) {
-      socket.emit('error', { message: 'Session not found.' });
-      return;
-    }
-    const roundIndex = payload?.roundIndex;
-    const optionIndex = payload?.optionIndex;
-    if (typeof roundIndex !== 'number' || typeof optionIndex !== 'number') {
-      socket.emit('error', { message: 'Invalid answer payload.' });
-      return;
-    }
-    const result = sessions.recordAnswer(session, socket.id, roundIndex, optionIndex);
-    if (!result.ok) {
-      socket.emit('error', { message: result.error });
-      return;
-    }
-    socket.emit('answer:recorded', {
-      correct: result.correct,
-      points: result.points,
-      timeLeft: result.timeLeft,
-    });
-    broadcastSession(code);
-    if (allPlayersAnswered(session)) {
-      goToResults(code);
-    }
-  });
-
-  socket.on('host:end', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const session = sessions.getSession(code);
-    if (!session) {
-      socket.emit('error', { message: 'Session not found.' });
-      return;
-    }
-    if (session.hostSocketId !== socket.id) {
-      socket.emit('error', { message: 'Only the host can end the session.' });
-      return;
-    }
-    endSession(code, 'The host ended the session.');
-  });
-
-  socket.on('player:leave', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
+  function snapshot(code, target = io.to(code)) {
     const session = sessions.getSession(code);
     if (!session) return;
-    const out = sessions.removePlayer(code, socket.id);
-    socket.leave(code);
-    if (out.ended) {
-      io.to(code).emit('session:ended', { reason: out.reason ?? 'Session ended.' });
-      return;
-    }
-    if (out.session) broadcastSession(code);
-  });
+    target.emit('session:snapshot', { session: serializeSession(session) });
+  }
 
-  socket.on('player:reconnect', (payload) => {
-    const code = String(payload?.code ?? '').toUpperCase();
-    const playerId = payload?.playerId;
-    const reconnectToken = payload?.reconnectToken;
-    if (!code || !playerId || !reconnectToken) {
-      socket.emit('reconnect:failed', { message: 'Invalid reconnect payload.' });
-      return;
-    }
-    const result = sessions.markReconnected(code, playerId, reconnectToken, socket.id, (s) => {
-      sessions.resumeRoundTimer(s, () => onRoundTimeout(code));
+  function delta(session, type, payload, target = io.to(session.code)) {
+    target.emit('session:delta', {
+      code: session.code,
+      version: session.version,
+      type,
+      payload,
     });
-    if (!result.ok) {
-      socket.emit('reconnect:failed', { message: result.error });
-      return;
-    }
-    const session = result.session;
-    socket.join(session.code);
-    broadcastSession(code);
-  });
+  }
 
-  socket.on('disconnect', () => {
-    const hit = sessions.markDisconnected(socket.id, (code, { reason }) => {
-      endSession(code, reason);
+  function endSession(code, reason) {
+    io.to(code).emit('session:ended', { reason });
+    const socketIds = [...(io.sockets.adapter.rooms.get(code) ?? [])];
+    for (const socketId of socketIds) {
+      const memberSocket = io.sockets.sockets.get(socketId);
+      if (!memberSocket) continue;
+      if (memberSocket.data.membership?.code === code) memberSocket.data.membership = null;
+      memberSocket.leave(code);
+    }
+    sessions.cleanupSession(code);
+  }
+
+  function goToResults(code) {
+    const session = sessions.getSession(code);
+    if (!session || !sessions.transitionToResults(session).ok) return;
+    snapshot(code);
+  }
+
+  function onRoundTimeout(code) {
+    goToResults(code);
+  }
+
+  function notifyPlayerChange(code, output) {
+    if (!output) return;
+    if (output.ended) return endSession(code, output.reason ?? 'Session ended.');
+    if (!output.session) return;
+    if (output.hostChanged) return snapshot(code);
+    if (output.removed) {
+      delta(output.session, 'player:remove', { playerId: output.player?.id });
+    } else if (output.player) {
+      delta(output.session, 'player:upsert', { player: serializePlayer(output.session, output.player) });
+    }
+    if (allPlayersAnswered(output.session)) goToResults(code);
+  }
+
+  sessions.onAfterPlayerChange = notifyPlayerChange;
+  sessions.onSessionExpired = (code, reason) => endSession(code, reason);
+
+  async function detachMembership(socket) {
+    const membership = socket.data.membership;
+    if (!membership) return;
+    socket.data.membership = null;
+    const output = sessions.removeParticipant(membership.code, membership.playerId, socket.id);
+    await socket.leave(membership.code);
+    notifyPlayerChange(membership.code, output);
+  }
+
+  async function attachMembership(socket, session, playerId, reconnectToken) {
+    if (
+      socket.data.membership &&
+      (socket.data.membership.code !== session.code || socket.data.membership.playerId !== playerId)
+    ) {
+      await detachMembership(socket);
+    }
+    socket.data.membership = { code: session.code, playerId, reconnectToken };
+    await socket.join(session.code);
+  }
+
+  function supersedePreviousSocket(previousSocketId, currentSocketId) {
+    if (!previousSocketId || previousSocketId === currentSocketId) return;
+    const previous = io.sockets.sockets.get(previousSocketId);
+    if (!previous) return;
+    previous.emit('session:superseded', { message: 'This player reconnected from another tab or device.' });
+    previous.disconnect(true);
+  }
+
+  async function restoreRequestMembership(socket, result) {
+    if (!result?.ok || !result.you?.reconnectToken || !result.session?.code) return result;
+    if (
+      socket.data.membership &&
+      (socket.data.membership.code !== result.session.code || socket.data.membership.playerId !== result.you.id)
+    ) {
+      return { ok: false, error: 'This retry belongs to an older session.' };
+    }
+    const restored = sessions.markReconnected(
+      result.session.code,
+      result.you.id,
+      result.you.reconnectToken,
+      socket.id,
+      (session) => sessions.resumeRoundTimer(session, () => onRoundTimeout(session.code)),
+    );
+    if (!restored.ok) return restored;
+
+    await attachMembership(socket, restored.session, result.you.id, result.you.reconnectToken);
+    supersedePreviousSocket(restored.previousSocketId, socket.id);
+    if (!restored.unchanged) {
+      if (restored.isHost) snapshot(restored.session.code, socket.to(restored.session.code));
+      else if (restored.player) {
+        delta(
+          restored.session,
+          'player:upsert',
+          { player: serializePlayer(restored.session, restored.player) },
+          socket.to(restored.session.code),
+        );
+      }
+    }
+    return { ...result, session: serializeSession(restored.session) };
+  }
+
+  function register(socket, event, handler, { cache = true } = {}) {
+    socket.on(event, async (payload = {}, acknowledgement) => {
+      const reply = typeof acknowledgement === 'function' ? acknowledgement : () => {};
+      if (!allowEvent(socket, event)) {
+        reply({ ok: false, error: 'Too many requests. Please wait a moment.' });
+        return;
+      }
+
+      const processRequest = async () => {
+        const key = cache ? requestKey(event, payload) : null;
+        const cached = key ? sessions.getCachedRequest(key) : null;
+        if (cached) {
+          reply(await restoreRequestMembership(socket, cached));
+          return;
+        }
+        if (key && inFlightRequests.has(key)) {
+          const result = await inFlightRequests.get(key);
+          reply(await restoreRequestMembership(socket, result));
+          return;
+        }
+        try {
+          const pending = Promise.resolve().then(() => handler(payload));
+          if (key) inFlightRequests.set(key, pending);
+          const result = await pending;
+          if (key) sessions.cacheRequest(key, result);
+          reply(result);
+        } catch (error) {
+          console.error(`Socket event ${event} failed`, error);
+          reply({ ok: false, error: 'Unexpected server error.' });
+        } finally {
+          if (key) inFlightRequests.delete(key);
+        }
+      };
+
+      const queued = socket.data.commandQueue.then(processRequest, processRequest);
+      socket.data.commandQueue = queued.catch(() => {});
+      await queued;
     });
-    if (hit) {
-      broadcastSession(hit.code);
-    }
-  });
-});
+  }
 
-server.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-});
+  io.on('connection', (socket) => {
+    socket.data.membership = null;
+    socket.data.rateBuckets = new Map();
+    socket.data.commandQueue = Promise.resolve();
+
+    register(socket, 'host:create', async (payload) => {
+      await detachMembership(socket);
+      const result = sessions.createSession(
+        payload?.name,
+        socket.id,
+        payload?.questions,
+        payload?.hostParticipates !== false,
+      );
+      if (!result.ok) return result;
+      const session = result.session;
+      await attachMembership(socket, session, session.hostId, session.hostReconnectToken);
+      return {
+        ok: true,
+        session: serializeSession(session),
+        you: {
+          id: session.hostId,
+          name: session.hostName,
+          isHost: true,
+          isPlayer: session.hostParticipates,
+          reconnectToken: session.hostReconnectToken,
+        },
+      };
+    });
+
+    register(socket, 'player:join', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase().trim();
+      if (!/^[A-Z0-9]{4}$/.test(code)) return { ok: false, error: 'Enter a valid 4-character code.' };
+      await detachMembership(socket);
+      const result = sessions.addPlayer(code, socket.id, payload?.name);
+      if (!result.ok) return result;
+      const { session, player } = result;
+      await attachMembership(socket, session, player.id, player.reconnectToken);
+      delta(session, 'player:upsert', { player: serializePlayer(session, player) }, socket.to(code));
+      return {
+        ok: true,
+        session: serializeSession(session),
+        you: {
+          id: player.id,
+          name: player.name,
+          isHost: false,
+          isPlayer: true,
+          reconnectToken: player.reconnectToken,
+        },
+      };
+    });
+
+    register(socket, 'player:reconnect', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase().trim();
+      const result = sessions.markReconnected(
+        code,
+        payload?.playerId,
+        payload?.reconnectToken,
+        socket.id,
+        (session) => sessions.resumeRoundTimer(session, () => onRoundTimeout(code)),
+      );
+      if (!result.ok) return result;
+      await attachMembership(socket, result.session, payload.playerId, payload.reconnectToken);
+      supersedePreviousSocket(result.previousSocketId, socket.id);
+      if (!result.unchanged) {
+        if (result.isHost) snapshot(code, socket.to(code));
+        else if (result.player) {
+          delta(
+            result.session,
+            'player:upsert',
+            { player: serializePlayer(result.session, result.player) },
+            socket.to(code),
+          );
+        }
+      }
+      return { ok: true, session: serializeSession(result.session) };
+    }, { cache: false });
+
+    register(socket, 'session:sync', async (payload) => {
+      const membership = socket.data.membership;
+      const code = String(payload?.code ?? '').toUpperCase();
+      if (!membership || membership.code !== code) return { ok: false, error: 'Not in this session.' };
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      return { ok: true, session: serializeSession(session) };
+    }, { cache: false });
+
+    register(socket, 'host:start', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      if (session.hostSocketId !== socket.id) return { ok: false, error: 'Only the host can start.' };
+      const result = sessions.startGame(session, () => onRoundTimeout(code));
+      if (!result.ok) return result;
+      snapshot(code);
+      return { ok: true, session: serializeSession(session) };
+    });
+
+    register(socket, 'host:showResults', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      if (session.hostSocketId !== socket.id) return { ok: false, error: 'Only the host can show results.' };
+      if (session.phase !== 'question') return { ok: false, error: 'Not in question phase.' };
+      goToResults(code);
+      return { ok: true };
+    });
+
+    register(socket, 'host:nextRound', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      if (session.hostSocketId !== socket.id) return { ok: false, error: 'Only the host can advance.' };
+      const result = sessions.nextRound(session, () => onRoundTimeout(code));
+      if (!result.ok) return result;
+      snapshot(code);
+      return { ok: true, final: result.final };
+    });
+
+    register(socket, 'player:answer', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const membership = socket.data.membership;
+      if (!membership || membership.code !== code) return { ok: false, error: 'Not in this session.' };
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      const result = sessions.recordAnswer(session, socket.id, payload?.roundIndex, payload?.optionIndex);
+      if (!result.ok) return result;
+      delta(session, 'player:upsert', { player: serializePlayer(session, result.player) });
+      const completed = allPlayersAnswered(session);
+      if (completed) goToResults(code);
+      return { ok: true, accepted: true };
+    });
+
+    register(socket, 'player:leave', async () => {
+      const membership = socket.data.membership;
+      if (!membership) return { ok: true };
+      socket.data.membership = null;
+      const output = sessions.removeParticipant(membership.code, membership.playerId, socket.id);
+      await socket.leave(membership.code);
+      notifyPlayerChange(membership.code, output);
+      return { ok: true };
+    });
+
+    register(socket, 'host:end', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      if (session.hostSocketId !== socket.id) return { ok: false, error: 'Only the host can end the session.' };
+      endSession(code, 'The host ended the session.');
+      return { ok: true };
+    });
+
+    socket.on('disconnect', () => {
+      const membership = socket.data.membership;
+      if (!membership) return;
+      const hit = sessions.markDisconnected(
+        membership.code,
+        membership.playerId,
+        socket.id,
+        (code, { reason }) => endSession(code, reason),
+      );
+      if (!hit) return;
+      if (hit.hostDisconnected) snapshot(hit.code);
+      else if (hit.player) {
+        delta(hit.session, 'player:upsert', { player: serializePlayer(hit.session, hit.player) });
+      }
+      if (!hit.hostDisconnected && allPlayersAnswered(hit.session)) goToResults(hit.code);
+    });
+  });
+
+  return {
+    app,
+    io,
+    server,
+    sessions,
+    listen(port = DEFAULT_PORT) {
+      return new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(port, () => {
+          server.off('error', reject);
+          resolve(server.address());
+        });
+      });
+    },
+    async close() {
+      sessions.close();
+      connectionBuckets.clear();
+      inFlightRequests.clear();
+      await new Promise((resolve) => io.close(resolve));
+    },
+  };
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  const trivia = createTriviaServer();
+  trivia.listen(DEFAULT_PORT).then(() => {
+    console.log(`Server listening on http://localhost:${DEFAULT_PORT}`);
+  });
+
+  let closing = false;
+  const shutdown = async (signal) => {
+    if (closing) return;
+    closing = true;
+    console.log(`${signal} received; closing connections.`);
+    await trivia.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}

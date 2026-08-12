@@ -1,8 +1,9 @@
 import { Navigate, useParams } from 'react-router-dom';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import toast from 'react-hot-toast';
 import { Loader2, WifiOff } from 'lucide-react';
 import { PageShell } from '../components/PageShell.jsx';
-import { socket } from '../lib/socket.js';
+import { emitWithAck } from '../lib/socket.js';
 import { getPersistedSession, useGameStore } from '../lib/store.js';
 import { cn } from '../lib/utils.js';
 import Question from './Question.jsx';
@@ -22,6 +23,8 @@ export default function Play() {
   const me = useGameStore((s) => s.me);
   const setSelectedAnswer = useGameStore((s) => s.setSelectedAnswer);
   const isHost = me?.id === session?.hostId;
+  const connectionStatus = useGameStore((s) => s.connectionStatus);
+  const [ending, setEnding] = useState(false);
 
   useEffect(() => {
     setSelectedAnswer(null);
@@ -43,6 +46,14 @@ export default function Play() {
 
   const round = session.currentRound ?? 0;
   const total = session.questions?.length ?? 0;
+
+  const endSession = async () => {
+    if (ending) return;
+    setEnding(true);
+    try { await emitWithAck('host:end', { code }); }
+    catch (error) { toast.error(error.message ?? 'Could not end the session'); }
+    finally { setEnding(false); }
+  };
 
   return (
     <PageShell maxWidthClass="max-w-2xl" className="space-y-5 py-4 sm:py-6">
@@ -70,7 +81,8 @@ export default function Play() {
                 'shrink-0 rounded-full border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-xs font-bold text-destructive transition-all hover:bg-destructive/20',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive focus-visible:ring-offset-2',
               )}
-              onClick={() => socket.emit('host:end', { code })}
+              onClick={endSession}
+              disabled={ending || connectionStatus !== 'connected'}
             >
               End session
             </button>

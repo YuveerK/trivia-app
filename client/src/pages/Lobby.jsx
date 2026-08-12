@@ -1,12 +1,17 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import { Loader2, Play, LogOut, Trash2, Wifi, WifiOff } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
 import { PageShell } from '../components/PageShell.jsx';
 import { PlayerBadge, avatarGradient } from '../components/PlayerBadge.jsx';
-import { socket } from '../lib/socket.js';
-import { getPersistedSession, useGameStore } from '../lib/store.js';
+import { emitWithAck } from '../lib/socket.js';
+import {
+  clearPendingLeave,
+  getPersistedSession,
+  queuePendingLeave,
+  useGameStore,
+} from '../lib/store.js';
 import { cn } from '../lib/utils.js';
 
 function canAccessLobby(code, me, session) {
@@ -23,6 +28,8 @@ export default function Lobby() {
   const session = useGameStore((s) => s.session);
   const me = useGameStore((s) => s.me);
   const reset = useGameStore((s) => s.reset);
+  const connectionStatus = useGameStore((s) => s.connectionStatus);
+  const [pendingAction, setPendingAction] = useState(null);
 
   useEffect(() => {
     if (!canAccessLobby(code, me, session)) navigate('/', { replace: true });
@@ -34,19 +41,43 @@ export default function Lobby() {
     if (session.phase !== 'lobby') navigate(`/play/${code}`, { replace: true });
   }, [session, code, navigate]);
 
-  const leave = () => {
-    socket.emit('player:leave', { code });
-    reset();
-    navigate('/');
+  const leave = async () => {
+    if (pendingAction) return;
+    setPendingAction('leave');
+    queuePendingLeave(code, me);
+    try {
+      if (connectionStatus === 'connected') {
+        await emitWithAck('player:leave', { code }, { attempts: 1, timeout: 3_000 });
+        clearPendingLeave();
+      }
+    } catch (error) {
+      toast.error(error.message ?? 'The server could not confirm that you left.');
+    } finally {
+      reset();
+      navigate('/');
+      setPendingAction(null);
+    }
   };
 
-  const start = () => {
-    const onErr = (payload) => { socket.off('error', onErr); toast.error(payload?.message ?? 'Could not start'); };
-    socket.once('error', onErr);
-    socket.emit('host:start', { code });
+  const start = async () => {
+    if (pendingAction) return;
+    setPendingAction('start');
+    try {
+      await emitWithAck('host:start', { code });
+    } catch (error) {
+      toast.error(error.message ?? 'Could not start');
+    } finally {
+      setPendingAction(null);
+    }
   };
 
-  const endSession = () => { socket.emit('host:end', { code }); };
+  const endSession = async () => {
+    if (pendingAction) return;
+    setPendingAction('end');
+    try { await emitWithAck('host:end', { code }); }
+    catch (error) { toast.error(error.message ?? 'Could not end the session'); }
+    finally { setPendingAction(null); }
+  };
 
   if (!session || session.code !== code) {
     return (
@@ -63,7 +94,8 @@ export default function Lobby() {
   const isHost = me?.id === session.hostId;
   const minimumPlayers = session.hostParticipates ? 2 : 1;
   const playerCount = session.players.length;
-  const canStart = playerCount >= minimumPlayers;
+  const connectedPlayerCount = session.players.filter((player) => player.connected && !player.departed).length;
+  const canStart = connectedPlayerCount >= minimumPlayers;
 
   return (
     <PageShell maxWidthClass="max-w-md" className="space-y-8 py-6 sm:py-10">
@@ -149,20 +181,20 @@ export default function Lobby() {
         {isHost && (
           <Button
             onClick={start}
-            disabled={!canStart}
+            disabled={!canStart || Boolean(pendingAction) || connectionStatus !== 'connected'}
             className="gap-2 text-lg"
           >
             <Play className="size-5 fill-white" aria-hidden />
-            {canStart ? 'Start game' : `Need ${minimumPlayers - playerCount} more player${minimumPlayers - playerCount !== 1 ? 's' : ''}`}
+            {pendingAction === 'start' ? 'Starting…' : canStart ? 'Start game' : `Need ${minimumPlayers - connectedPlayerCount} more connected player${minimumPlayers - connectedPlayerCount !== 1 ? 's' : ''}`}
           </Button>
         )}
         {isHost && (
-          <Button variant="destructive" onClick={endSession} className="gap-2">
+          <Button variant="destructive" onClick={endSession} className="gap-2" disabled={Boolean(pendingAction) || connectionStatus !== 'connected'}>
             <Trash2 className="size-4" aria-hidden />
             End session for everyone
           </Button>
         )}
-        <Button variant="outline" onClick={leave} className="gap-2">
+        <Button variant="outline" onClick={leave} className="gap-2" disabled={Boolean(pendingAction)}>
           <LogOut className="size-4" aria-hidden />
           Leave session
         </Button>

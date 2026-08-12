@@ -1,8 +1,9 @@
+import { useState } from 'react';
 import toast from 'react-hot-toast';
 import { CheckCircle2, XCircle, ChevronRight, Flag } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
-import { socket } from '../lib/socket.js';
+import { emitWithAck } from '../lib/socket.js';
 import { useGameStore } from '../lib/store.js';
 import { cn } from '../lib/utils.js';
 
@@ -16,6 +17,8 @@ const ANSWER_COLORS = [
 export default function Results({ code }) {
   const session = useGameStore((s) => s.session);
   const me = useGameStore((s) => s.me);
+  const connectionStatus = useGameStore((s) => s.connectionStatus);
+  const [advancing, setAdvancing] = useState(false);
 
   const round = session?.currentRound ?? 0;
   const q = session?.questions?.[round];
@@ -25,10 +28,12 @@ export default function Results({ code }) {
   const isHost = me?.id === session.hostId;
   const isLast = round >= total - 1;
 
-  const next = () => {
-    const onErr = (payload) => { socket.off('error', onErr); toast.error(payload?.message ?? 'Could not advance'); };
-    socket.once('error', onErr);
-    socket.emit('host:nextRound', { code });
+  const next = async () => {
+    if (advancing) return;
+    setAdvancing(true);
+    try { await emitWithAck('host:nextRound', { code }); }
+    catch (error) { toast.error(error.message ?? 'Could not advance'); }
+    finally { setAdvancing(false); }
   };
 
   if (!q) return null;
@@ -179,7 +184,7 @@ export default function Results({ code }) {
       </div>
 
       {isHost && (
-        <Button onClick={next} className="gap-2 text-base">
+        <Button onClick={next} className="gap-2 text-base" disabled={advancing || connectionStatus !== 'connected'}>
           {isLast ? (
             <>
               <Flag className="size-5" aria-hidden />

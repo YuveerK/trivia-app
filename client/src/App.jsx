@@ -1,117 +1,240 @@
 import { useEffect } from 'react';
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { Toaster, toast } from 'react-hot-toast';
-import { Zap } from 'lucide-react';
+import { WifiOff, Zap } from 'lucide-react';
 import { ThemeToggle } from './components/ThemeToggle.jsx';
 import Home from './pages/Home.jsx';
 import Lobby from './pages/Lobby.jsx';
 import Play from './pages/Play.jsx';
 import Final from './pages/Final.jsx';
-import { socket } from './lib/socket.js';
-import { getPersistedSession, persistSession, useGameStore } from './lib/store.js';
+import { emitWithAck, socket } from './lib/socket.js';
+import {
+  applySessionDelta,
+  clearPendingLeave,
+  getPendingLeave,
+  getPersistedSession,
+  persistSession,
+  queuePendingLeave,
+  useGameStore,
+} from './lib/store.js';
 
 const toastOptions = {
   duration: 4000,
   className: 'font-sans text-sm font-medium',
   style: {
-    background: 'hsl(var(--popover))',
-    color: 'hsl(var(--popover-foreground))',
-    border: '1px solid hsl(var(--border))',
-    borderRadius: '0.75rem',
-    boxShadow: '0 20px 40px -10px rgba(0,0,0,0.25), 0 0 0 1px hsl(var(--border))',
-    maxWidth: '22rem',
-    padding: '12px 16px',
-  },
-  success: {
-    iconTheme: { primary: 'hsl(var(--primary))', secondary: 'hsl(var(--popover))' },
-  },
-  error: {
-    iconTheme: { primary: 'hsl(var(--destructive))', secondary: 'hsl(var(--popover))' },
+    background: 'hsl(var(--popover))', color: 'hsl(var(--popover-foreground))',
+    border: '1px solid hsl(var(--border))', borderRadius: '0.75rem',
+    boxShadow: '0 20px 40px -10px rgba(0,0,0,0.25)', maxWidth: '22rem', padding: '12px 16px',
   },
 };
 
 function AppRoutes() {
   const navigate = useNavigate();
-  const setSession = useGameStore((s) => s.setSession);
-  const reset = useGameStore((s) => s.reset);
+  const session = useGameStore((state) => state.session);
+  const connectionStatus = useGameStore((state) => state.connectionStatus);
+  const reset = useGameStore((state) => state.reset);
 
   useEffect(() => {
-    const emitReconnect = () => {
-      const raw = getPersistedSession();
-      if (!raw?.code || !raw?.me?.id || !raw?.me?.reconnectToken) return;
-      useGameStore.setState({ me: raw.me });
-      socket.emit('player:reconnect', {
-        code: raw.code,
-        playerId: raw.me.id,
-        reconnectToken: raw.me.reconnectToken,
-      });
+    let syncing = false;
+    let reconnecting = false;
+    let reconnectTimer = null;
+    let disposed = false;
+
+    const scheduleReconnect = (callback, delay = 2_000) => {
+      if (disposed) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(callback, delay);
     };
 
-    const onUpdate = ({ session }) => {
-      setSession(session);
-      const me = useGameStore.getState().me;
-      if (me && session?.code) {
-        persistSession(session.code, useGameStore.getState().me);
+    const reconnect = async () => {
+      if (reconnecting || disposed) return;
+      reconnecting = true;
+      useGameStore.getState().setConnectionStatus('reconnecting');
+      const pendingLeave = getPendingLeave();
+      const persisted = getPersistedSession();
+      const leavingPersistedSession = Boolean(
+        pendingLeave?.code === persisted?.code && pendingLeave?.me?.id === persisted?.me?.id,
+      );
+
+      // A different current saved game is newer than an old, unconfirmed leave.
+      // Joining/creating it already detached the socket from its prior room.
+      if (
+        persisted?.code &&
+        persisted?.me?.id &&
+        persisted?.me?.reconnectToken &&
+        !leavingPersistedSession
+      ) {
+        if (pendingLeave) clearPendingLeave();
+        try {
+          const result = await emitWithAck('player:reconnect', {
+            code: persisted.code,
+            playerId: persisted.me.id,
+            reconnectToken: persisted.me.reconnectToken,
+          }, { attempts: 1 });
+          useGameStore.setState({
+            me: persisted.me,
+            session: result.session,
+            connectionStatus: 'connected',
+          });
+        } catch (error) {
+          if (error.code === 'OFFLINE' || error.code === 'TIMEOUT') {
+            const connected = socket.connected;
+            useGameStore.getState().setConnectionStatus(connected ? 'reconnecting' : 'offline');
+            if (connected) scheduleReconnect(reconnect);
+          } else {
+            toast.error(error.message ?? 'Could not reconnect to the session.');
+            reset();
+            useGameStore.getState().setConnectionStatus('connected');
+            navigate('/', { replace: true });
+          }
+        } finally {
+          reconnecting = false;
+        }
+        return;
+      }
+
+      if (leavingPersistedSession) {
+        reset();
+        navigate('/', { replace: true });
+      }
+
+      if (pendingLeave?.code && pendingLeave?.me?.reconnectToken) {
+        try {
+          await emitWithAck('player:reconnect', {
+            code: pendingLeave.code,
+            playerId: pendingLeave.me.id,
+            reconnectToken: pendingLeave.me.reconnectToken,
+          }, { attempts: 1 });
+          await emitWithAck('player:leave', { code: pendingLeave.code }, { attempts: 1 });
+          clearPendingLeave();
+        } catch (error) {
+          if (error.code === 'OFFLINE' || error.code === 'TIMEOUT') {
+            const connected = socket.connected;
+            useGameStore.getState().setConnectionStatus(connected ? 'reconnecting' : 'offline');
+            if (connected) scheduleReconnect(reconnect);
+            reconnecting = false;
+            return;
+          }
+          // Missing/ended sessions are terminal and no longer need a pending leave.
+          clearPendingLeave();
+        }
+      }
+      useGameStore.getState().setConnectionStatus(socket.connected ? 'connected' : 'offline');
+      reconnecting = false;
+    };
+
+    const syncSession = async (code) => {
+      if (syncing || !socket.connected) return;
+      syncing = true;
+      try {
+        const result = await emitWithAck('session:sync', { code }, { attempts: 1 });
+        useGameStore.getState().setSession(result.session);
+      } catch {
+        // The reconnect path will recover the snapshot if the connection is unstable.
+      } finally {
+        syncing = false;
       }
     };
 
+    const onSnapshot = ({ session: nextSession }) => {
+      const current = useGameStore.getState().session;
+      if (current?.code === nextSession?.code && current.version > nextSession.version) return;
+      useGameStore.getState().setSession(nextSession);
+    };
+
+    const onDelta = (delta) => {
+      const current = useGameStore.getState().session;
+      const result = applySessionDelta(current, delta);
+      if (result.needsSync) syncSession(delta.code);
+      else if (result.session !== current) useGameStore.getState().setSession(result.session);
+    };
+
     const onEnded = ({ reason }) => {
-      toast(reason ?? 'Session ended');
+      toast(reason ?? 'Session ended.');
       reset();
       navigate('/', { replace: true });
     };
 
-    const onError = ({ message }) => {
-      toast.error(message ?? 'Something went wrong');
-    };
-
-    const onReconnectFailed = ({ message }) => {
-      toast.error(message ?? 'Could not reconnect to the session');
+    const onSuperseded = ({ message }) => {
+      toast.error(message ?? 'This session was opened elsewhere.');
       reset();
       navigate('/', { replace: true });
     };
 
-    socket.on('connect', emitReconnect);
-    socket.on('session:update', onUpdate);
+    const onDisconnect = (reason) => {
+      useGameStore.getState().setConnectionStatus('offline');
+      if (reason === 'io server disconnect') {
+        // A superseded tab is sent home, where it should be able to start or
+        // join a different game without requiring a page refresh.
+        scheduleReconnect(() => socket.connect(), 0);
+      }
+    };
+
+    socket.on('connect', reconnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('session:snapshot', onSnapshot);
+    socket.on('session:delta', onDelta);
     socket.on('session:ended', onEnded);
-    socket.on('error', onError);
-    socket.on('reconnect:failed', onReconnectFailed);
-
+    socket.on('session:superseded', onSuperseded);
     socket.connect();
-    if (socket.connected) emitReconnect();
+    if (socket.connected) reconnect();
 
     return () => {
-      socket.off('connect', emitReconnect);
-      socket.off('session:update', onUpdate);
+      disposed = true;
+      clearTimeout(reconnectTimer);
+      socket.off('connect', reconnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('session:snapshot', onSnapshot);
+      socket.off('session:delta', onDelta);
       socket.off('session:ended', onEnded);
-      socket.off('error', onError);
-      socket.off('reconnect:failed', onReconnectFailed);
+      socket.off('session:superseded', onSuperseded);
     };
-  }, [navigate, reset, setSession]);
+  }, [navigate, reset]);
+
+  useEffect(() => {
+    const me = useGameStore.getState().me;
+    if (session?.code && me) persistSession(session.code, me);
+  }, [session]);
+
+  const goHome = async () => {
+    const current = useGameStore.getState().session;
+    const me = useGameStore.getState().me;
+    if (current?.code && me) queuePendingLeave(current.code, me);
+    if (current?.code && socket.connected) {
+      try {
+        await emitWithAck('player:leave', { code: current.code }, { attempts: 1, timeout: 2_000 });
+        clearPendingLeave();
+      }
+      catch { /* Disconnect cleanup remains the fallback. */ }
+    }
+    reset();
+    navigate('/');
+  };
 
   return (
     <div className="relative min-h-screen">
-      {/* Grain texture overlay */}
       <div className="pointer-events-none fixed inset-0 z-0 grain opacity-60 dark:opacity-40" aria-hidden />
-
-      {/* Global header */}
       <header className="fixed left-0 right-0 top-0 z-50 flex items-center justify-between px-4 py-3 sm:px-6">
-        <a
-          href="/"
-          className="group inline-flex items-center gap-2 rounded-full border border-border/60 bg-card/80 px-3 py-2 shadow-stage backdrop-blur-md transition-all hover:border-primary/40 hover:shadow-glow-sm"
-          aria-label="Home"
+        <button
+          type="button"
+          onClick={goHome}
+          className="group inline-flex items-center gap-2 rounded-full border border-border/60 bg-card/80 px-3 py-2 shadow-stage backdrop-blur-md transition-all hover:border-primary/40"
+          aria-label="Leave game and go home"
         >
-          <span className="flex size-6 items-center justify-center rounded-full bg-primary shadow-glow-sm">
+          <span className="flex size-6 items-center justify-center rounded-full bg-primary">
             <Zap className="size-3.5 fill-white text-white" aria-hidden />
           </span>
-          <span className="text-sm font-bold tracking-tight text-foreground">
-            Trivia<span className="text-primary">Live</span>
-          </span>
-        </a>
-        <ThemeToggle />
+          <span className="text-sm font-bold text-foreground">Trivia<span className="text-primary">Live</span></span>
+        </button>
+        <div className="flex items-center gap-2">
+          {connectionStatus !== 'connected' && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-700">
+              <WifiOff className="size-3" /> {connectionStatus === 'offline' ? 'Offline' : 'Reconnecting'}
+            </span>
+          )}
+          <ThemeToggle />
+        </div>
       </header>
-
-      {/* Page content — padded for fixed header */}
       <div className="relative z-10 pt-16">
         <Toaster position="top-center" toastOptions={toastOptions} />
         <Routes>

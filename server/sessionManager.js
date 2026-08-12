@@ -1,38 +1,18 @@
 import { randomBytes, randomInt, randomUUID } from 'crypto';
-import { allPlayersAnswered, calculateScore, validateQuestionPack } from './gameLogic.js';
+import { calculateScore, validateQuestionPack } from './gameLogic.js';
 import { defaultQuestions } from './defaultQuestions.js';
+import { MemorySessionStore } from './sessionStore.js';
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+export const MAX_PLAYERS = 50;
+const MAX_NAME_LENGTH = 30;
+const SESSION_IDLE_MS = 4 * 60 * 60 * 1000;
 const PLAYER_GRACE_MS = 30_000;
 const HOST_ABSENT_MS = 60_000;
 
-/** @typedef {'lobby' | 'question' | 'results' | 'final'} Phase */
-
-/** @param {Record<string, unknown>} session */
-export function serializeSession(session) {
-  const {
-    roundTimer: _rt,
-    hostAbsentTimer: _hat,
-    playerGraceTimers: _pgt,
-    hostSocketId: _hsi,
-    hostReconnectToken: _hrt,
-    ...rest
-  } = session;
-  return JSON.parse(
-    JSON.stringify({
-      ...rest,
-      players: session.players.map((player) => serializePlayer(session, player)),
-      questions: serializeQuestions(session),
-    }),
-  );
-}
-
 function generateCode() {
   let code = '';
-  for (let i = 0; i < 4; i++) {
-    code += CODE_CHARS[randomInt(0, CODE_CHARS.length)];
-  }
+  for (let i = 0; i < 4; i++) code += CODE_CHARS[randomInt(0, CODE_CHARS.length)];
   return code;
 }
 
@@ -40,110 +20,216 @@ function generateReconnectToken() {
   return randomBytes(32).toString('base64url');
 }
 
-function createPlayer(name, socketId, id = randomUUID(), reconnectToken = generateReconnectToken()) {
+export function normalizeDisplayName(value) {
+  if (typeof value !== 'string') {
+    return { ok: false, error: 'Name must be text.' };
+  }
+
+  const name = value
+    .normalize('NFKC')
+    .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+
+  const length = Array.from(name).length;
+  if (length === 0) return { ok: false, error: 'Name is required.' };
+  if (!/[\p{L}\p{N}\p{S}]/u.test(name)) {
+    return { ok: false, error: 'Name must contain a visible letter, number, or symbol.' };
+  }
+  if (length > MAX_NAME_LENGTH) {
+    return { ok: false, error: `Name must be ${MAX_NAME_LENGTH} characters or fewer.` };
+  }
+  return { ok: true, name };
+}
+
+function canonicalName(name) {
+  return name.normalize('NFKC').toLocaleLowerCase('en');
+}
+
+function allocateDisplayName(session, baseName) {
+  const used = new Set(session.players.map((player) => canonicalName(player.name)));
+  if (!session.hostParticipates) used.add(canonicalName(session.hostName));
+  if (!used.has(canonicalName(baseName))) return baseName;
+
+  for (let suffix = 2; suffix <= MAX_PLAYERS + 1; suffix++) {
+    const ending = ` (${suffix})`;
+    const trimmedBase = Array.from(baseName).slice(0, MAX_NAME_LENGTH - ending.length).join('').trimEnd();
+    const candidate = `${trimmedBase}${ending}`;
+    if (!used.has(canonicalName(candidate))) return candidate;
+  }
+  const ending = ` (${randomUUID().slice(0, 4)})`;
+  return `${Array.from(baseName).slice(0, MAX_NAME_LENGTH - ending.length).join('').trimEnd()}${ending}`;
+}
+
+function createPlayer(baseName, name, socketId, id = randomUUID(), reconnectToken = generateReconnectToken()) {
   return {
     id,
     socketId,
     reconnectToken,
-    name: String(name).trim(),
+    baseName,
+    name,
     score: 0,
     answers: {},
     connected: true,
+    departed: false,
   };
 }
 
 function shuffleQuestionOptions(question) {
-  const options = question.options.map((option, index) => ({
-    option,
-    originalIndex: index,
-  }));
-
+  const options = question.options.map((option, index) => ({ option, originalIndex: index }));
   for (let i = options.length - 1; i > 0; i--) {
     const j = randomInt(0, i + 1);
     [options[i], options[j]] = [options[j], options[i]];
   }
-
   return {
-    ...question,
-    options: options.map((entry) => entry.option),
+    q: question.q.trim(),
+    options: options.map((entry) => entry.option.trim()),
     correct: options.findIndex((entry) => entry.originalIndex === question.correct),
   };
 }
 
 function prepareQuestions(questions) {
-  return questions.map((question) => shuffleQuestionOptions(question));
+  return questions.map(shuffleQuestionOptions);
 }
 
 function canRevealQuestion(session, index) {
-  if (session.phase === 'final') return true;
-  if (index < session.currentRound) return true;
-  return session.phase === 'results' && index === session.currentRound;
+  return (
+    session.phase === 'final' ||
+    index < session.currentRound ||
+    (session.phase === 'results' && index === session.currentRound)
+  );
 }
 
 function serializeQuestions(session) {
   return session.questions.map((question, index) => {
     const showBody = index <= session.currentRound || session.phase === 'final';
-    const out = showBody
-      ? { q: question.q, options: question.options }
-      : { q: '', options: [] };
-
-    if (canRevealQuestion(session, index)) {
-      out.correct = question.correct;
-    }
-
-    return out;
+    const output = showBody ? { q: question.q, options: question.options } : { q: '', options: [] };
+    if (canRevealQuestion(session, index)) output.correct = question.correct;
+    return output;
   });
 }
 
 function serializeAnswers(session, answers) {
   return Object.fromEntries(
-    Object.entries(answers).map(([round, answer]) => {
-      const roundIndex = Number(round);
-      if (canRevealQuestion(session, roundIndex)) return [round, answer];
-      return [round, { submitted: true }];
-    }),
+    Object.entries(answers).map(([round, answer]) =>
+      canRevealQuestion(session, Number(round)) ? [round, answer] : [round, { submitted: true }],
+    ),
   );
 }
 
-function serializePlayer(session, player) {
+export function serializePlayer(session, player) {
+  const currentAnswer = player.answers[session.currentRound];
+  const hiddenCurrentPoints = session.phase === 'question' && currentAnswer?.correct
+    ? currentAnswer.points
+    : 0;
   return {
     id: player.id,
     name: player.name,
-    score: player.score,
+    score: Math.max(0, player.score - hiddenCurrentPoints),
     answers: serializeAnswers(session, player.answers),
     connected: player.connected,
+    departed: player.departed,
+  };
+}
+
+function elapsedMs(session, now = Date.now()) {
+  if (session.phase !== 'question') return 0;
+  const currentSegment = session.roundStart == null ? 0 : Math.max(0, now - session.roundStart);
+  return Math.max(0, session.roundElapsedMs + currentSegment);
+}
+
+export function getRemainingMs(session, now = Date.now()) {
+  if (session.phase !== 'question') return 0;
+  return Math.max(0, session.roundDuration * 1000 - elapsedMs(session, now));
+}
+
+export function serializeSession(session) {
+  const now = Date.now();
+  return {
+    code: session.code,
+    hostId: session.hostId,
+    hostName: session.hostName,
+    hostParticipates: session.hostParticipates,
+    players: session.players.map((player) => serializePlayer(session, player)),
+    questions: serializeQuestions(session),
+    currentRound: session.currentRound,
+    phase: session.phase,
+    roundDuration: session.roundDuration,
+    paused: session.paused,
+    hostDisconnected: session.hostDisconnected,
+    remainingMs: getRemainingMs(session, now),
+    serverNow: now,
+    version: session.version,
   };
 }
 
 export class SessionManager {
-  constructor() {
-    /** @type {Map<string, any>} */
-    this.sessions = new Map();
-    /** @type {((code: string, out: { ended?: boolean, reason?: string, session?: any }) => void) | null} */
+  constructor(store = new MemorySessionStore()) {
+    this.store = store;
     this.onAfterPlayerChange = null;
+    this.onSessionExpired = null;
+    this.requestCache = new Map();
     this.cleanupInterval = setInterval(() => this.pruneOldSessions(), 10 * 60 * 1000);
+    this.cleanupInterval.unref?.();
+  }
+
+  close() {
+    clearInterval(this.cleanupInterval);
+    for (const [, session] of this.store.entries()) this.clearSessionTimers(session);
+    this.requestCache.clear();
   }
 
   getActiveCount() {
-    return this.sessions.size;
+    return this.store.size;
   }
 
-  pruneOldSessions() {
-    const now = Date.now();
-    for (const [code, session] of this.sessions) {
-      if (now - session.createdAt > SESSION_MAX_AGE_MS) {
-        this.cleanupSession(code, 'Session expired.');
+  getSession(code) {
+    if (!code) return null;
+    return this.store.get(String(code).toUpperCase()) ?? null;
+  }
+
+  touch(session) {
+    session.updatedAt = Date.now();
+    session.version += 1;
+  }
+
+  getCachedRequest(key) {
+    const item = key ? this.requestCache.get(key) : null;
+    if (!item) return null;
+    if (item.expiresAt <= Date.now()) {
+      this.requestCache.delete(key);
+      return null;
+    }
+    return item.value;
+  }
+
+  cacheRequest(key, value) {
+    if (!key) return;
+    this.requestCache.set(key, { value, expiresAt: Date.now() + 5 * 60 * 1000 });
+    if (this.requestCache.size > 10_000) {
+      const now = Date.now();
+      for (const [cacheKey, item] of this.requestCache) {
+        if (item.expiresAt <= now) this.requestCache.delete(cacheKey);
+      }
+      while (this.requestCache.size > 10_000) {
+        this.requestCache.delete(this.requestCache.keys().next().value);
       }
     }
   }
 
-  /**
-   * @param {string} hostName
-   * @param {string} hostSocketId
-   * @param {unknown} questionsInput
-   * @param {boolean} hostParticipates
-   */
-  createSession(hostName, hostSocketId, questionsInput, hostParticipates = true) {
+  pruneOldSessions() {
+    const now = Date.now();
+    for (const [code, session] of this.store.entries()) {
+      if (now - session.updatedAt <= SESSION_IDLE_MS) continue;
+      if (this.onSessionExpired) this.onSessionExpired(code, 'Session expired after four hours of inactivity.');
+      else this.cleanupSession(code);
+    }
+  }
+
+  createSession(hostNameInput, hostSocketId, questionsInput, hostParticipates = true) {
+    const normalized = normalizeDisplayName(hostNameInput);
+    if (!normalized.ok) return normalized;
+
     let questions = defaultQuestions;
     if (questionsInput != null && questionsInput !== '') {
       let parsed = questionsInput;
@@ -154,369 +240,313 @@ export class SessionManager {
           return { ok: false, error: 'Invalid JSON for custom questions.' };
         }
       }
-      const v = validateQuestionPack(parsed);
-      if (!v.valid) return { ok: false, error: v.error };
-      questions = prepareQuestions(parsed);
-    } else {
-      const v = validateQuestionPack(defaultQuestions);
-      if (!v.valid) return { ok: false, error: v.error };
-      questions = prepareQuestions(defaultQuestions);
+      const validation = validateQuestionPack(parsed);
+      if (!validation.valid) return { ok: false, error: validation.error };
+      questions = parsed;
     }
+
+    const defaultValidation = validateQuestionPack(questions);
+    if (!defaultValidation.valid) return { ok: false, error: defaultValidation.error };
 
     let code = '';
-    for (let attempt = 0; attempt < 5; attempt++) {
+    for (let attempt = 0; attempt < 10; attempt++) {
       code = generateCode();
-      if (!this.sessions.has(code)) break;
-      if (attempt === 4) {
-        return { ok: false, error: 'Could not generate a unique session code. Try again.' };
-      }
+      if (!this.store.has(code)) break;
+      if (attempt === 9) return { ok: false, error: 'Could not generate a unique session code.' };
     }
 
+    const now = Date.now();
     const hostId = randomUUID();
     const hostReconnectToken = generateReconnectToken();
-
-    /** @type {any} */
     const session = {
       code,
       hostId,
       hostSocketId,
       hostReconnectToken,
-      hostName: String(hostName).trim(),
+      hostName: normalized.name,
       hostParticipates,
       players: hostParticipates
-        ? [createPlayer(hostName, hostSocketId, hostId, hostReconnectToken)]
+        ? [createPlayer(normalized.name, normalized.name, hostSocketId, hostId, hostReconnectToken)]
         : [],
-      questions,
+      questions: prepareQuestions(questions),
       currentRound: -1,
-      phase: /** @type {Phase} */ ('lobby'),
-      roundStart: null,
+      phase: 'lobby',
       roundDuration: 20,
-      createdAt: Date.now(),
+      roundStart: null,
+      roundElapsedMs: 0,
+      paused: false,
       roundTimer: null,
       hostDisconnected: false,
-      pausedRemainingMs: null,
       hostAbsentTimer: null,
-      playerGraceTimers: /** @type {Map<string, NodeJS.Timeout>} */ (new Map()),
+      playerGraceTimers: new Map(),
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
     };
-
-    this.sessions.set(code, session);
+    this.store.set(code, session);
     return { ok: true, session };
   }
 
-  /** @param {string} code */
-  getSession(code) {
-    if (!code) return null;
-    return this.sessions.get(String(code).toUpperCase()) ?? null;
-  }
-
-  /**
-   * @param {string} code
-   * @param {string} socketId
-   * @param {string} name
-   */
-  addPlayer(code, socketId, name) {
+  addPlayer(code, socketId, nameInput) {
     const session = this.getSession(code);
     if (!session) return { ok: false, error: 'Session not found.' };
-    if (session.phase !== 'lobby') {
-      return { ok: false, error: 'This game has already started.' };
+    if (session.phase !== 'lobby') return { ok: false, error: 'This game has already started.' };
+    if (session.players.length >= MAX_PLAYERS) {
+      return { ok: false, error: `This session is full (${MAX_PLAYERS} players).` };
     }
-    const trimmed = String(name).trim();
-    if (!trimmed) return { ok: false, error: 'Name is required.' };
-    const lower = trimmed.toLowerCase();
-    if (session.players.some((p) => p.name.toLowerCase() === lower)) {
-      return { ok: false, error: 'That name is already taken in this session.' };
-    }
-    const player = createPlayer(trimmed, socketId);
+    const normalized = normalizeDisplayName(nameInput);
+    if (!normalized.ok) return normalized;
+    const name = allocateDisplayName(session, normalized.name);
+    const player = createPlayer(normalized.name, name, socketId);
     session.players.push(player);
+    this.touch(session);
     return { ok: true, session, player };
   }
 
-  /**
-   * @param {string} code
-   * @param {string} socketId
-   * @returns {{ ended?: boolean, reason?: string, session?: any }}
-   */
-  removePlayer(code, socketId) {
+  clearPlayerGraceTimer(session, playerId) {
+    const timer = session.playerGraceTimers.get(playerId);
+    if (timer) clearTimeout(timer);
+    session.playerGraceTimers.delete(playerId);
+  }
+
+  clearSessionTimers(session) {
+    if (session.roundTimer) clearTimeout(session.roundTimer);
+    if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+    for (const timer of session.playerGraceTimers.values()) clearTimeout(timer);
+    session.roundTimer = null;
+    session.hostAbsentTimer = null;
+    session.playerGraceTimers.clear();
+  }
+
+  cleanupSession(code) {
+    const session = this.getSession(code);
+    if (!session) return;
+    this.clearSessionTimers(session);
+    this.store.delete(session.code);
+  }
+
+  removeParticipant(code, playerId, socketId) {
     const session = this.getSession(code);
     if (!session) return {};
-    const isHostSocket = session.hostSocketId === socketId;
+    const isHost = session.hostId === playerId && session.hostSocketId === socketId;
+    const player = session.players.find((item) => item.id === playerId && item.socketId === socketId);
 
-    if (isHostSocket && !session.players.some((p) => p.socketId === socketId)) {
-      this.cleanupSession(code, 'The host left the session.');
+    if (!player && !isHost) return { session, ignored: true };
+    if (isHost && !player) {
+      this.cleanupSession(code);
       return { ended: true, reason: 'The host left the session.' };
     }
 
-    const idx = session.players.findIndex((p) => p.socketId === socketId);
-    if (idx === -1) return { session };
+    if (player) this.clearPlayerGraceTimer(session, player.id);
 
-    const [removedPlayer] = session.players.splice(idx, 1);
-    this.clearPlayerGraceTimer(session, removedPlayer.id);
+    if (session.phase === 'lobby') {
+      const index = session.players.findIndex((item) => item.id === playerId);
+      if (index >= 0) session.players.splice(index, 1);
+    } else if (player) {
+      player.connected = false;
+      player.departed = true;
+      player.socketId = null;
+    }
 
-    if (session.players.length === 0) {
+    const activePlayers = session.players.filter((item) => !item.departed);
+    if (activePlayers.length === 0) {
       this.cleanupSession(code);
       return { ended: true, reason: 'Everyone left the session.' };
     }
 
-    if (isHostSocket) {
-      const next = session.players.find((p) => p.connected) ?? session.players[0];
+    let hostChanged = false;
+    if (isHost) {
+      const next = activePlayers.find((item) => item.connected);
+      if (!next) {
+        this.cleanupSession(code);
+        return { ended: true, reason: 'No connected player could take over as host.' };
+      }
       session.hostId = next.id;
       session.hostSocketId = next.socketId;
       session.hostReconnectToken = next.reconnectToken;
       session.hostName = next.name;
       session.hostParticipates = true;
       session.hostDisconnected = false;
-      session.pausedRemainingMs = null;
-      if (session.hostAbsentTimer) {
-        clearTimeout(session.hostAbsentTimer);
-        session.hostAbsentTimer = null;
-      }
+      if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+      session.hostAbsentTimer = null;
+      hostChanged = true;
     }
 
-    return { session };
+    this.touch(session);
+    return {
+      session,
+      player,
+      removed: session.phase === 'lobby',
+      hostChanged,
+    };
   }
 
-  /** @param {any} session @param {string} playerId */
-  clearPlayerGraceTimer(session, playerId) {
-    const t = session.playerGraceTimers.get(playerId);
-    if (t) clearTimeout(t);
-    session.playerGraceTimers.delete(playerId);
-  }
-
-  /**
-   * @param {string} code
-   * @param {string} reason
-   */
-  cleanupSession(code, reason = 'Session ended.') {
+  markDisconnected(code, playerId, socketId, onHostAbsentEnd) {
     const session = this.getSession(code);
-    if (!session) return;
-    if (session.roundTimer) clearTimeout(session.roundTimer);
-    if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
-    for (const t of session.playerGraceTimers.values()) clearTimeout(t);
-    session.playerGraceTimers.clear();
-    this.sessions.delete(code);
-    return { reason };
-  }
+    if (!session) return null;
+    const player = session.players.find((item) => item.id === playerId);
+    const isCurrentPlayerSocket = player?.socketId === socketId;
+    const isCurrentHostSocket = session.hostId === playerId && session.hostSocketId === socketId;
+    if (!isCurrentPlayerSocket && !isCurrentHostSocket) return null;
 
-  /** @param {string} code */
-  getStandings(code) {
-    const session = this.getSession(code);
-    if (!session) return [];
-    return [...session.players].sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.name.localeCompare(b.name);
-    });
-  }
-
-  /**
-   * @param {string} socketId
-   * @param {(code: string, payload: { reason: string }) => void} onHostAbsentEnd
-   */
-  markDisconnected(socketId, onHostAbsentEnd) {
-    for (const [code, session] of this.sessions) {
-      const player = session.players.find((p) => p.socketId === socketId);
-      const isHostSocket = session.hostSocketId === socketId;
-      if (!player && !isHostSocket) continue;
-
-      if (player) {
-        player.connected = false;
-        this.clearPlayerGraceTimer(session, player.id);
-
+    if (player && isCurrentPlayerSocket) {
+      player.connected = false;
+      this.clearPlayerGraceTimer(session, player.id);
+      if (session.phase === 'lobby' && !isCurrentHostSocket) {
         const grace = setTimeout(() => {
           session.playerGraceTimers.delete(player.id);
-          if (session.phase === 'lobby') {
-            const out = this.removePlayer(code, socketId);
-            if (this.onAfterPlayerChange) this.onAfterPlayerChange(code, out);
-          }
+          const out = this.removeParticipant(code, player.id, socketId);
+          this.onAfterPlayerChange?.(code, out);
         }, PLAYER_GRACE_MS);
+        grace.unref?.();
         session.playerGraceTimers.set(player.id, grace);
       }
-
-      if (isHostSocket) {
-        session.hostDisconnected = true;
-        if (session.phase === 'question' && session.roundStart != null) {
-          const elapsed = Date.now() - session.roundStart;
-          const total = session.roundDuration * 1000;
-          session.pausedRemainingMs = Math.max(0, total - elapsed);
-          if (session.roundTimer) {
-            clearTimeout(session.roundTimer);
-            session.roundTimer = null;
-          }
-        }
-        if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
-        session.hostAbsentTimer = setTimeout(() => {
-          session.hostAbsentTimer = null;
-          if (session.hostDisconnected) {
-            onHostAbsentEnd(code, { reason: 'Host did not reconnect. Session ended.' });
-          }
-        }, HOST_ABSENT_MS);
-      }
-
-      return { code, session };
     }
-    return null;
+
+    if (isCurrentHostSocket) {
+      session.hostDisconnected = true;
+      if (session.phase === 'question' && !session.paused) {
+        session.roundElapsedMs = elapsedMs(session);
+        session.roundStart = null;
+        session.paused = true;
+        this.clearRoundTimer(session);
+      }
+      if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+      session.hostAbsentTimer = setTimeout(() => {
+        session.hostAbsentTimer = null;
+        if (session.hostDisconnected) {
+          onHostAbsentEnd(code, { reason: 'Host did not reconnect. Session ended.' });
+        }
+      }, HOST_ABSENT_MS);
+      session.hostAbsentTimer.unref?.();
+    }
+
+    this.touch(session);
+    return { code, session, player, hostDisconnected: isCurrentHostSocket };
   }
 
-  /**
-   * @param {string} code
-   * @param {string} playerId
-   * @param {string} reconnectToken
-   * @param {string} newSocketId
-   * @param {(session: any) => void} [onResumeRound]
-   */
   markReconnected(code, playerId, reconnectToken, newSocketId, onResumeRound) {
     const session = this.getSession(code);
     if (!session) return { ok: false, error: 'Session not found.' };
-    const player = session.players.find((p) => p.id === playerId);
+    const player = session.players.find((item) => item.id === playerId);
     const isHost = session.hostId === playerId;
     if (!player && !isHost) return { ok: false, error: 'Player not found in session.' };
+    if (player?.departed) return { ok: false, error: 'This player has left the session.' };
 
     const playerTokenOk = player?.reconnectToken === reconnectToken;
     const hostTokenOk = isHost && session.hostReconnectToken === reconnectToken;
-    if (!playerTokenOk && !hostTokenOk) {
-      return { ok: false, error: 'Invalid reconnect credentials.' };
+    if (!playerTokenOk && !hostTokenOk) return { ok: false, error: 'Invalid reconnect credentials.' };
+
+    const previousSocketId = isHost ? session.hostSocketId : player?.socketId;
+    if (previousSocketId === newSocketId && player?.connected && !session.hostDisconnected) {
+      return { ok: true, session, player, isHost, previousSocketId: null, unchanged: true };
     }
 
-    if (player) this.clearPlayerGraceTimer(session, player.id);
-
     if (player) {
+      this.clearPlayerGraceTimer(session, player.id);
       player.socketId = newSocketId;
       player.connected = true;
     }
-
     if (isHost) {
       session.hostSocketId = newSocketId;
       session.hostDisconnected = false;
-      if (session.hostAbsentTimer) {
-        clearTimeout(session.hostAbsentTimer);
-        session.hostAbsentTimer = null;
-      }
-      if (session.phase === 'question' && session.pausedRemainingMs != null) {
-        const remaining = session.pausedRemainingMs;
-        session.pausedRemainingMs = null;
-        session.roundStart = Date.now() - (session.roundDuration * 1000 - remaining);
-        if (onResumeRound) onResumeRound(session);
+      if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+      session.hostAbsentTimer = null;
+      if (session.phase === 'question' && session.paused) {
+        session.paused = false;
+        session.roundStart = Date.now();
+        onResumeRound?.(session);
       }
     }
-
-    return { ok: true, session };
+    this.touch(session);
+    return { ok: true, session, player, isHost, previousSocketId };
   }
 
-  /**
-   * @param {any} session
-   * @param {() => void} onTimeoutToResults
-   */
   startRoundTimer(session, onTimeoutToResults) {
-    if (session.roundTimer) clearTimeout(session.roundTimer);
-    const ms = session.roundDuration * 1000;
+    this.clearRoundTimer(session);
+    const remaining = getRemainingMs(session);
     session.roundTimer = setTimeout(() => {
       session.roundTimer = null;
-      if (session.phase === 'question') onTimeoutToResults();
-    }, ms);
+      if (session.phase === 'question' && !session.paused) onTimeoutToResults();
+    }, remaining);
+    session.roundTimer.unref?.();
   }
 
-  /**
-   * Resume timer after host reconnect (remaining portion only).
-   * @param {any} session
-   * @param {() => void} onTimeoutToResults
-   */
   resumeRoundTimer(session, onTimeoutToResults) {
-    if (session.roundTimer) clearTimeout(session.roundTimer);
-    const remaining = Math.max(
-      0,
-      session.roundDuration * 1000 - (Date.now() - (session.roundStart ?? Date.now())),
-    );
-    session.roundTimer = setTimeout(() => {
-      session.roundTimer = null;
-      if (session.phase === 'question') onTimeoutToResults();
-    }, remaining);
+    this.startRoundTimer(session, onTimeoutToResults);
   }
 
   clearRoundTimer(session) {
-    if (session.roundTimer) {
-      clearTimeout(session.roundTimer);
-      session.roundTimer = null;
-    }
+    if (session.roundTimer) clearTimeout(session.roundTimer);
+    session.roundTimer = null;
   }
 
-  /**
-   * @param {any} session
-   * @param {string} socketId
-   * @param {number} roundIndex
-   * @param {number} optionIndex
-   */
-  recordAnswer(session, socketId, roundIndex, optionIndex) {
-    if (session.phase !== 'question') {
-      return { ok: false, error: 'Not accepting answers right now.' };
-    }
-    if (roundIndex !== session.currentRound) {
-      return { ok: false, error: 'Wrong round.' };
-    }
-    const player = session.players.find((p) => p.socketId === socketId);
-    if (!player) return { ok: false, error: 'Player not in session.' };
-    if (player.answers[roundIndex]) {
-      return { ok: false, error: 'You already answered this round.' };
-    }
-
-    const q = session.questions[roundIndex];
-    if (!q) return { ok: false, error: 'Invalid round.' };
-
-    const now = Date.now();
-    if (session.roundStart == null) {
-      return { ok: false, error: 'Round not active.' };
-    }
-
-    const elapsedSec = (now - session.roundStart) / 1000;
-    if (elapsedSec >= session.roundDuration) {
-      return { ok: false, error: 'Time is up for this question.' };
-    }
-
-    const timeLeftSec = Math.max(0, session.roundDuration - elapsedSec);
-    const correct = optionIndex === q.correct;
-    const points = correct ? calculateScore(timeLeftSec, session.roundDuration) : 0;
-
-    player.answers[roundIndex] = {
-      idx: optionIndex,
-      correct,
-      points,
-      time: elapsedSec,
-    };
-    if (correct) player.score += points;
-
-    return { ok: true, correct, points, timeLeft: timeLeftSec };
-  }
-
-  transitionToResults(session) {
-    this.clearRoundTimer(session);
-    session.phase = 'results';
-    session.roundStart = null;
-    session.pausedRemainingMs = null;
-  }
-
-  /**
-   * @param {any} session
-   * @param {() => void} onTimeoutToResults
-   */
   startGame(session, onTimeoutToResults) {
-    const minPlayers = session.hostParticipates ? 2 : 1;
-    if (session.players.length < minPlayers) {
+    if (session.phase !== 'lobby') return { ok: false, error: 'The game has already started.' };
+    const connectedPlayers = session.players.filter((player) => player.connected && !player.departed);
+    const minimum = session.hostParticipates ? 2 : 1;
+    if (connectedPlayers.length < minimum) {
       return {
         ok: false,
         error: session.hostParticipates
-          ? 'Need at least two players to start.'
-          : 'Need at least one player to start.',
+          ? 'Need at least two connected players to start.'
+          : 'Need at least one connected player to start.',
       };
     }
     session.currentRound = 0;
     session.phase = 'question';
+    session.roundElapsedMs = 0;
     session.roundStart = Date.now();
+    session.paused = false;
     this.startRoundTimer(session, onTimeoutToResults);
+    this.touch(session);
     return { ok: true };
   }
 
-  /**
-   * @param {any} session
-   * @param {() => void} onTimeoutToResults
-   */
+  recordAnswer(session, socketId, roundIndex, optionIndex) {
+    if (session.phase !== 'question') return { ok: false, error: 'Not accepting answers right now.' };
+    if (session.paused) return { ok: false, error: 'The game is paused while the host reconnects.' };
+    if (!Number.isInteger(roundIndex) || roundIndex !== session.currentRound) {
+      return { ok: false, error: 'Wrong round.' };
+    }
+    const question = session.questions[roundIndex];
+    if (!question) return { ok: false, error: 'Invalid round.' };
+    if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= question.options.length) {
+      return { ok: false, error: 'Invalid answer option.' };
+    }
+    const player = session.players.find(
+      (item) => item.socketId === socketId && item.connected && !item.departed,
+    );
+    if (!player) return { ok: false, error: 'Player not in session.' };
+    if (player.answers[roundIndex]) return { ok: false, error: 'You already answered this round.' };
+
+    const remaining = getRemainingMs(session);
+    if (remaining <= 0) return { ok: false, error: 'Time is up for this question.' };
+    const timeLeftSec = remaining / 1000;
+    const correct = optionIndex === question.correct;
+    const points = correct ? calculateScore(timeLeftSec, session.roundDuration) : 0;
+    player.answers[roundIndex] = {
+      idx: optionIndex,
+      correct,
+      points,
+      time: session.roundDuration - timeLeftSec,
+    };
+    if (correct) player.score += points;
+    this.touch(session);
+    return { ok: true, player, correct, points };
+  }
+
+  transitionToResults(session) {
+    if (session.phase !== 'question') return { ok: false };
+    this.clearRoundTimer(session);
+    session.phase = 'results';
+    session.roundStart = null;
+    session.roundElapsedMs = 0;
+    session.paused = false;
+    this.touch(session);
+    return { ok: true };
+  }
+
   nextRound(session, onTimeoutToResults) {
     if (session.phase !== 'results') return { ok: false, error: 'Not in results phase.' };
     const next = session.currentRound + 1;
@@ -524,13 +554,19 @@ export class SessionManager {
       session.phase = 'final';
       session.currentRound = session.questions.length - 1;
       session.roundStart = null;
+      session.roundElapsedMs = 0;
+      session.paused = false;
       this.clearRoundTimer(session);
+      this.touch(session);
       return { ok: true, final: true };
     }
     session.currentRound = next;
     session.phase = 'question';
+    session.roundElapsedMs = 0;
     session.roundStart = Date.now();
+    session.paused = false;
     this.startRoundTimer(session, onTimeoutToResults);
+    this.touch(session);
     return { ok: true, final: false };
   }
 }

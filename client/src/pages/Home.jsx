@@ -6,13 +6,14 @@ import { Button } from '../components/Button.jsx';
 import { Input } from '../components/Input.jsx';
 import { PageShell } from '../components/PageShell.jsx';
 import { cn } from '../lib/utils.js';
-import { socket } from '../lib/socket.js';
-import { persistSession, useGameStore } from '../lib/store.js';
+import { emitWithAck } from '../lib/socket.js';
+import { clearPendingLeave, persistSession, useGameStore } from '../lib/store.js';
 
 export default function Home() {
   const navigate = useNavigate();
   const setSession = useGameStore((s) => s.setSession);
   const setMe = useGameStore((s) => s.setMe);
+  const connectionStatus = useGameStore((s) => s.connectionStatus);
 
   const [hostName, setHostName] = useState('');
   const [hostParticipates, setHostParticipates] = useState(true);
@@ -21,29 +22,12 @@ export default function Home() {
 
   const [joinName, setJoinName] = useState('');
   const [joinCode, setJoinCode] = useState('');
+  const [pendingAction, setPendingAction] = useState(null);
 
-  const handleCreate = (e) => {
+  const handleCreate = async (e) => {
     e.preventDefault();
+    if (pendingAction) return;
     if (!hostName.trim()) { toast.error('Please enter your name.'); return; }
-
-    const onCreated = (payload) => {
-      socket.off('session:created', onCreated);
-      socket.off('error', onErr);
-      const { session, you } = payload;
-      setSession(session);
-      setMe(you);
-      persistSession(session.code, you);
-      toast.success(`Session ${session.code} created`);
-      navigate(`/lobby/${session.code}`);
-    };
-    const onErr = (payload) => {
-      socket.off('session:created', onCreated);
-      socket.off('error', onErr);
-      toast.error(payload?.message ?? 'Could not create session');
-    };
-
-    socket.once('session:created', onCreated);
-    socket.once('error', onErr);
 
     const payload = { name: hostName.trim(), hostParticipates };
     if (customize && questionsJson.trim()) {
@@ -51,39 +35,46 @@ export default function Home() {
         payload.questions = JSON.parse(questionsJson);
       } catch {
         toast.error('Custom questions must be valid JSON.');
-        socket.off('session:created', onCreated);
-        socket.off('error', onErr);
         return;
       }
     }
-    socket.emit('host:create', payload);
+    setPendingAction('create');
+    try {
+      const { session, you } = await emitWithAck('host:create', payload);
+      setSession(session);
+      setMe(you);
+      clearPendingLeave();
+      persistSession(session.code, you);
+      toast.success(`Session ${session.code} created`);
+      navigate(`/lobby/${session.code}`);
+    } catch (error) {
+      toast.error(error.message ?? 'Could not create session');
+    } finally {
+      setPendingAction(null);
+    }
   };
 
-  const handleJoin = (e) => {
+  const handleJoin = async (e) => {
     e.preventDefault();
+    if (pendingAction) return;
     if (!joinName.trim()) { toast.error('Please enter your name.'); return; }
     const code = joinCode.trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(code)) { toast.error('Join code must be 4 characters.'); return; }
 
-    const onJoined = (payload) => {
-      socket.off('session:joined', onJoined);
-      socket.off('error', onErr);
-      const { session, you } = payload;
+    setPendingAction('join');
+    try {
+      const { session, you } = await emitWithAck('player:join', { code, name: joinName.trim() });
       setSession(session);
       setMe(you);
+      clearPendingLeave();
       persistSession(session.code, you);
       toast.success(`Joined session ${session.code}`);
       navigate(`/lobby/${session.code}`);
-    };
-    const onErr = (payload) => {
-      socket.off('session:joined', onJoined);
-      socket.off('error', onErr);
-      toast.error(payload?.message ?? 'Could not join');
-    };
-
-    socket.once('session:joined', onJoined);
-    socket.once('error', onErr);
-    socket.emit('player:join', { code, name: joinName.trim() });
+    } catch (error) {
+      toast.error(error.message ?? 'Could not join');
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   return (
@@ -172,6 +163,7 @@ export default function Home() {
                   value={hostName}
                   onChange={(e) => setHostName(e.target.value)}
                   placeholder="Alex Mercer"
+                  maxLength={30}
                 />
               </div>
             </div>
@@ -211,8 +203,8 @@ export default function Home() {
               </div>
             )}
 
-            <Button type="submit" className="gap-2">
-              Create session <ArrowRight className="size-4" aria-hidden />
+            <Button type="submit" className="gap-2" disabled={Boolean(pendingAction) || connectionStatus !== 'connected'}>
+              {pendingAction === 'create' ? 'Creating…' : 'Create session'} <ArrowRight className="size-4" aria-hidden />
             </Button>
           </form>
         </div>
@@ -249,6 +241,7 @@ export default function Home() {
                   value={joinName}
                   onChange={(e) => setJoinName(e.target.value)}
                   placeholder="Jordan Lee"
+                  maxLength={30}
                 />
               </div>
             </div>
@@ -292,8 +285,8 @@ export default function Home() {
               </div>
             )}
 
-            <Button type="submit" className="gap-2">
-              Join game <ArrowRight className="size-4" aria-hidden />
+            <Button type="submit" className="gap-2" disabled={Boolean(pendingAction) || connectionStatus !== 'connected'}>
+              {pendingAction === 'join' ? 'Joining…' : 'Join game'} <ArrowRight className="size-4" aria-hidden />
             </Button>
           </form>
         </div>
