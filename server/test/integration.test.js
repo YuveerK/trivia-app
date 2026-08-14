@@ -126,7 +126,7 @@ test('accepts a burst of 50 simultaneous joins and rejects the 51st', async () =
   assert.equal(results.session.players.filter((player) => player.answers[0]).length, 50);
 });
 
-test('supersedes an older socket and restores a paused host session', async () => {
+test('supersedes an older socket and restores a disconnected host session without pausing', async () => {
   const trivia = createTriviaServer();
   const address = await trivia.listen(0);
   const url = `http://127.0.0.1:${address.port}`;
@@ -147,11 +147,15 @@ test('supersedes an older socket and restores a paused host session', async () =
     optionIndex: 0,
   });
 
-  const pausedSnapshot = waitFor(player, 'session:snapshot', ({ session }) => session.paused);
+  const disconnectedSnapshot = waitFor(
+    player,
+    'session:snapshot',
+    ({ session }) => session.hostDisconnected,
+  );
   host.disconnect();
-  const paused = await pausedSnapshot;
-  assert.equal(paused.session.hostDisconnected, true);
-  assert.equal(paused.session.phase, 'question');
+  const disconnected = await disconnectedSnapshot;
+  assert.equal(disconnected.session.hostDisconnected, true);
+  assert.equal(disconnected.session.phase, 'question');
 
   const replacement = await connect(url); sockets.push(replacement);
   const reconnected = await request(replacement, 'player:reconnect', {
@@ -160,9 +164,8 @@ test('supersedes an older socket and restores a paused host session', async () =
     reconnectToken: created.you.reconnectToken,
   });
   assert.equal(reconnected.ok, true);
-  assert.equal(reconnected.session.paused, false);
   assert.equal(reconnected.session.hostDisconnected, false);
-  assert.ok(reconnected.session.remainingMs <= paused.session.remainingMs);
+  assert.ok(reconnected.session.remainingMs <= disconnected.session.remainingMs);
 
   const newest = await connect(url); sockets.push(newest);
   const supersededNotice = waitFor(replacement, 'session:superseded');
@@ -252,4 +255,97 @@ test('an old cached join retry cannot detach a player from a newer session', asy
   }, oldRequestId);
   assert.equal(staleRetry.ok, false);
   assert.equal((await request(player, 'session:sync', { code: second.session.code })).ok, true);
+});
+
+test('a rejected create or join does not detach the caller from their current session', async () => {
+  const trivia = createTriviaServer();
+  const address = await trivia.listen(0);
+  const url = `http://127.0.0.1:${address.port}`;
+  const host = await connect(url);
+  const player = await connect(url);
+  test.after(async () => {
+    host.disconnect();
+    player.disconnect();
+    await trivia.close();
+  });
+
+  const created = await request(host, 'host:create', { name: 'Host', hostParticipates: false });
+  const joined = await request(player, 'player:join', { code: created.session.code, name: 'Player' });
+  assert.equal(joined.ok, true);
+
+  const invalidJoin = await request(player, 'player:join', { code: 'ZZZZ', name: 'Player' });
+  assert.equal(invalidJoin.ok, false);
+  assert.equal((await request(player, 'session:sync', { code: created.session.code })).ok, true);
+
+  const invalidCreate = await request(player, 'host:create', {
+    name: 'Player',
+    questions: [{ q: '', options: ['One', 'Two'], correct: 0 }],
+  });
+  assert.equal(invalidCreate.ok, false);
+  assert.equal((await request(player, 'session:sync', { code: created.session.code })).ok, true);
+});
+
+test('a spectator host keeps an empty lobby open for replacement players', async () => {
+  const trivia = createTriviaServer();
+  const address = await trivia.listen(0);
+  const url = `http://127.0.0.1:${address.port}`;
+  const host = await connect(url);
+  const first = await connect(url);
+  const replacement = await connect(url);
+  test.after(async () => {
+    host.disconnect();
+    first.disconnect();
+    replacement.disconnect();
+    await trivia.close();
+  });
+
+  const created = await request(host, 'host:create', { name: 'Host', hostParticipates: false });
+  assert.equal((await request(first, 'player:join', {
+    code: created.session.code,
+    name: 'First',
+  })).ok, true);
+  assert.equal((await request(first, 'player:leave', { code: created.session.code })).ok, true);
+
+  const joined = await request(replacement, 'player:join', {
+    code: created.session.code,
+    name: 'Replacement',
+  });
+  assert.equal(joined.ok, true);
+  assert.equal(joined.session.players.length, 1);
+});
+
+test('host handoff immediately finishes a round when every remaining player answered', async () => {
+  const trivia = createTriviaServer();
+  const address = await trivia.listen(0);
+  const url = `http://127.0.0.1:${address.port}`;
+  const host = await connect(url);
+  const player = await connect(url);
+  test.after(async () => {
+    host.disconnect();
+    player.disconnect();
+    await trivia.close();
+  });
+
+  const created = await request(host, 'host:create', { name: 'Host', hostParticipates: true });
+  const joined = await request(player, 'player:join', { code: created.session.code, name: 'Player' });
+  await request(host, 'host:start', { code: created.session.code });
+  await request(player, 'player:answer', {
+    code: created.session.code,
+    roundIndex: 0,
+    optionIndex: 0,
+  });
+
+  const oldHostSocketId = host.id;
+  const disconnected = waitFor(player, 'session:snapshot', ({ session }) => session.hostDisconnected);
+  host.disconnect();
+  await disconnected;
+
+  const results = waitFor(player, 'session:snapshot', ({ session }) => session.phase === 'results');
+  const session = trivia.sessions.getSession(created.session.code);
+  const output = trivia.sessions.removeParticipant(created.session.code, created.you.id, oldHostSocketId);
+  trivia.sessions.onAfterPlayerChange(created.session.code, output);
+  const snapshot = await results;
+
+  assert.equal(snapshot.session.hostId, joined.you.id);
+  assert.equal(snapshot.session.phase, 'results');
 });

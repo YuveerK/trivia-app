@@ -7,7 +7,10 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const MAX_PLAYERS = 50;
 const MAX_NAME_LENGTH = 30;
 const SESSION_IDLE_MS = 4 * 60 * 60 * 1000;
-const PLAYER_GRACE_MS = 30_000;
+const LOBBY_GRACE_MS = 30_000;
+// A player in a live round has more to lose than one idling in the lobby, so
+// they get longer to survive a tunnel or a WiFi handover before being dropped.
+const IN_GAME_GRACE_MS = 60_000;
 const HOST_ABSENT_MS = 60_000;
 
 function generateCode() {
@@ -155,7 +158,6 @@ export function serializeSession(session) {
     currentRound: session.currentRound,
     phase: session.phase,
     roundDuration: session.roundDuration,
-    paused: session.paused,
     hostDisconnected: session.hostDisconnected,
     remainingMs: getRemainingMs(session, now),
     serverNow: now,
@@ -274,7 +276,6 @@ export class SessionManager {
       roundDuration: 20,
       roundStart: null,
       roundElapsedMs: 0,
-      paused: false,
       roundTimer: null,
       hostDisconnected: false,
       hostAbsentTimer: null,
@@ -332,43 +333,35 @@ export class SessionManager {
     const player = session.players.find((item) => item.id === playerId && item.socketId === socketId);
 
     if (!player && !isHost) return { session, ignored: true };
-    if (isHost && !player) {
-      this.cleanupSession(code);
-      return { ended: true, reason: 'The host left the session.' };
+
+    if (player) {
+      this.clearPlayerGraceTimer(session, player.id);
+      if (session.phase === 'lobby') {
+        const index = session.players.findIndex((item) => item.id === playerId);
+        if (index >= 0) session.players.splice(index, 1);
+      } else {
+        player.connected = false;
+        player.departed = true;
+        player.socketId = null;
+      }
     }
 
-    if (player) this.clearPlayerGraceTimer(session, player.id);
-
-    if (session.phase === 'lobby') {
-      const index = session.players.findIndex((item) => item.id === playerId);
-      if (index >= 0) session.players.splice(index, 1);
-    } else if (player) {
-      player.connected = false;
-      player.departed = true;
-      player.socketId = null;
-    }
-
-    const activePlayers = session.players.filter((item) => !item.departed);
-    if (activePlayers.length === 0) {
+    const noActivePlayers = session.players.every((item) => item.departed);
+    // An empty lobby is valid for a connected spectator host: it is also how a
+    // new spectator-hosted room starts. Keep that room available for new joins.
+    // Once a game is underway, or when the host itself leaves, nobody remains
+    // who can meaningfully continue an empty session.
+    if (noActivePlayers && (session.phase !== 'lobby' || isHost)) {
       this.cleanupSession(code);
       return { ended: true, reason: 'Everyone left the session.' };
     }
 
     let hostChanged = false;
     if (isHost) {
-      const next = activePlayers.find((item) => item.connected);
-      if (!next) {
+      if (!this.promoteNewHost(session)) {
         this.cleanupSession(code);
         return { ended: true, reason: 'No connected player could take over as host.' };
       }
-      session.hostId = next.id;
-      session.hostSocketId = next.socketId;
-      session.hostReconnectToken = next.reconnectToken;
-      session.hostName = next.name;
-      session.hostParticipates = true;
-      session.hostDisconnected = false;
-      if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
-      session.hostAbsentTimer = null;
       hostChanged = true;
     }
 
@@ -376,12 +369,61 @@ export class SessionManager {
     return {
       session,
       player,
-      removed: session.phase === 'lobby',
+      removed: session.phase === 'lobby' && Boolean(player),
       hostChanged,
     };
   }
 
-  markDisconnected(code, playerId, socketId, onHostAbsentEnd) {
+  /**
+   * Hands the host role to a connected player. A spectator host has no player
+   * record of its own, so this is also what keeps their room alive.
+   * @returns {boolean} false when nobody is available to take over.
+   */
+  promoteNewHost(session) {
+    const next = session.players.find((item) => item.connected && !item.departed);
+    if (!next) return false;
+    session.hostId = next.id;
+    session.hostSocketId = next.socketId;
+    session.hostReconnectToken = next.reconnectToken;
+    session.hostName = next.name;
+    session.hostParticipates = true;
+    session.hostDisconnected = false;
+    if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+    session.hostAbsentTimer = null;
+    return true;
+  }
+
+  /**
+   * Drops a player who never came back. Without this a mid-game disconnect
+   * lingers forever and stops every later round from ending early.
+   */
+  schedulePlayerReap(session, player, socketId) {
+    const { code } = session;
+    const delay = session.phase === 'lobby' ? LOBBY_GRACE_MS : IN_GAME_GRACE_MS;
+    const grace = setTimeout(() => {
+      session.playerGraceTimers.delete(player.id);
+      const output = this.removeParticipant(code, player.id, socketId);
+      this.onAfterPlayerChange?.(code, output);
+    }, delay);
+    grace.unref?.();
+    session.playerGraceTimers.set(player.id, grace);
+  }
+
+  scheduleHostReap(session) {
+    const { code, hostSocketId } = session;
+    if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
+    session.hostAbsentTimer = setTimeout(() => {
+      session.hostAbsentTimer = null;
+      if (!session.hostDisconnected) return;
+      // Treat a vanished host like one who left deliberately: pass the room to a
+      // connected player instead of destroying an otherwise healthy game.
+      const output = this.removeParticipant(code, session.hostId, hostSocketId);
+      this.onAfterPlayerChange?.(code, output);
+    }, HOST_ABSENT_MS);
+    session.hostAbsentTimer.unref?.();
+  }
+
+  markDisconnected(code, playerId, socketId) {
     const session = this.getSession(code);
     if (!session) return null;
     const player = session.players.find((item) => item.id === playerId);
@@ -392,40 +434,23 @@ export class SessionManager {
     if (player && isCurrentPlayerSocket) {
       player.connected = false;
       this.clearPlayerGraceTimer(session, player.id);
-      if (session.phase === 'lobby' && !isCurrentHostSocket) {
-        const grace = setTimeout(() => {
-          session.playerGraceTimers.delete(player.id);
-          const out = this.removeParticipant(code, player.id, socketId);
-          this.onAfterPlayerChange?.(code, out);
-        }, PLAYER_GRACE_MS);
-        grace.unref?.();
-        session.playerGraceTimers.set(player.id, grace);
-      }
+      // The host is reaped by its own absence timer, so it must not be queued twice.
+      if (!isCurrentHostSocket) this.schedulePlayerReap(session, player, socketId);
     }
 
     if (isCurrentHostSocket) {
       session.hostDisconnected = true;
-      if (session.phase === 'question' && !session.paused) {
-        session.roundElapsedMs = elapsedMs(session);
-        session.roundStart = null;
-        session.paused = true;
-        this.clearRoundTimer(session);
-      }
-      if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
-      session.hostAbsentTimer = setTimeout(() => {
-        session.hostAbsentTimer = null;
-        if (session.hostDisconnected) {
-          onHostAbsentEnd(code, { reason: 'Host did not reconnect. Session ended.' });
-        }
-      }, HOST_ABSENT_MS);
-      session.hostAbsentTimer.unref?.();
+      // The server owns the round clock, so it remains authoritative even when
+      // the host disappears. Pausing here let repeated reconnects extend a
+      // question indefinitely and gave every participant extra answer time.
+      this.scheduleHostReap(session);
     }
 
     this.touch(session);
     return { code, session, player, hostDisconnected: isCurrentHostSocket };
   }
 
-  markReconnected(code, playerId, reconnectToken, newSocketId, onResumeRound) {
+  markReconnected(code, playerId, reconnectToken, newSocketId) {
     const session = this.getSession(code);
     if (!session) return { ok: false, error: 'Session not found.' };
     const player = session.players.find((item) => item.id === playerId);
@@ -438,7 +463,8 @@ export class SessionManager {
     if (!playerTokenOk && !hostTokenOk) return { ok: false, error: 'Invalid reconnect credentials.' };
 
     const previousSocketId = isHost ? session.hostSocketId : player?.socketId;
-    if (previousSocketId === newSocketId && player?.connected && !session.hostDisconnected) {
+    const alreadyConnected = player ? player.connected : isHost;
+    if (previousSocketId === newSocketId && alreadyConnected && !session.hostDisconnected) {
       return { ok: true, session, player, isHost, previousSocketId: null, unchanged: true };
     }
 
@@ -452,11 +478,6 @@ export class SessionManager {
       session.hostDisconnected = false;
       if (session.hostAbsentTimer) clearTimeout(session.hostAbsentTimer);
       session.hostAbsentTimer = null;
-      if (session.phase === 'question' && session.paused) {
-        session.paused = false;
-        session.roundStart = Date.now();
-        onResumeRound?.(session);
-      }
     }
     this.touch(session);
     return { ok: true, session, player, isHost, previousSocketId };
@@ -467,13 +488,9 @@ export class SessionManager {
     const remaining = getRemainingMs(session);
     session.roundTimer = setTimeout(() => {
       session.roundTimer = null;
-      if (session.phase === 'question' && !session.paused) onTimeoutToResults();
+      if (session.phase === 'question') onTimeoutToResults();
     }, remaining);
     session.roundTimer.unref?.();
-  }
-
-  resumeRoundTimer(session, onTimeoutToResults) {
-    this.startRoundTimer(session, onTimeoutToResults);
   }
 
   clearRoundTimer(session) {
@@ -497,7 +514,6 @@ export class SessionManager {
     session.phase = 'question';
     session.roundElapsedMs = 0;
     session.roundStart = Date.now();
-    session.paused = false;
     this.startRoundTimer(session, onTimeoutToResults);
     this.touch(session);
     return { ok: true };
@@ -505,7 +521,6 @@ export class SessionManager {
 
   recordAnswer(session, socketId, roundIndex, optionIndex) {
     if (session.phase !== 'question') return { ok: false, error: 'Not accepting answers right now.' };
-    if (session.paused) return { ok: false, error: 'The game is paused while the host reconnects.' };
     if (!Number.isInteger(roundIndex) || roundIndex !== session.currentRound) {
       return { ok: false, error: 'Wrong round.' };
     }
@@ -542,7 +557,6 @@ export class SessionManager {
     session.phase = 'results';
     session.roundStart = null;
     session.roundElapsedMs = 0;
-    session.paused = false;
     this.touch(session);
     return { ok: true };
   }
@@ -555,7 +569,6 @@ export class SessionManager {
       session.currentRound = session.questions.length - 1;
       session.roundStart = null;
       session.roundElapsedMs = 0;
-      session.paused = false;
       this.clearRoundTimer(session);
       this.touch(session);
       return { ok: true, final: true };
@@ -564,7 +577,6 @@ export class SessionManager {
     session.phase = 'question';
     session.roundElapsedMs = 0;
     session.roundStart = Date.now();
-    session.paused = false;
     this.startRoundTimer(session, onTimeoutToResults);
     this.touch(session);
     return { ok: true, final: false };

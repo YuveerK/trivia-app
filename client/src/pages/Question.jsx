@@ -5,6 +5,7 @@ import { Button } from '../components/Button.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
 import { TimerBar } from '../components/TimerBar.jsx';
 import { projectedPoints } from '../lib/scoring.js';
+import { resolveLockedAnswerIndex } from '../lib/answerState.js';
 import { emitWithAck } from '../lib/socket.js';
 import { useGameStore } from '../lib/store.js';
 import { cn } from '../lib/utils.js';
@@ -80,13 +81,7 @@ export default function Question({ code }) {
   const leader = standings[0];
   const canAnswer = Boolean(myPlayer);
   const myAnswer = myPlayer?.answers?.[round];
-  const lockedIdx = canAnswer
-    ? typeof myAnswer?.idx === 'number'
-      ? myAnswer.idx
-      : myAnswer
-        ? -1
-        : selectedAnswer
-    : null;
+  const lockedIdx = resolveLockedAnswerIndex(canAnswer, myAnswer, selectedAnswer);
 
   useEffect(() => {
     setLastFeedback(null);
@@ -103,7 +98,7 @@ export default function Question({ code }) {
   const duration = session?.roundDuration ?? 20;
 
   const handlePick = async (idx) => {
-    if (lockedIdx != null || pendingAnswer || session.paused || connectionStatus !== 'connected') return;
+    if (lockedIdx != null || pendingAnswer || connectionStatus !== 'connected') return;
     setSelectedAnswer(idx);
     setPendingAnswer(true);
     try {
@@ -178,7 +173,7 @@ export default function Question({ code }) {
               Question {round + 1} of {total}
             </span>
           </div>
-          <LivePoints remainingMs={session.remainingMs} durationSec={duration} paused={session.paused} />
+          <LivePoints remainingMs={session.remainingMs} durationSec={duration} />
         </div>
 
         {/* Question text + timer */}
@@ -189,7 +184,7 @@ export default function Question({ code }) {
             </h2>
           </div>
           <div className="shrink-0 self-center sm:self-start">
-            <TimerBar remainingMs={session.remainingMs} durationSec={duration} paused={session.paused} />
+            <TimerBar remainingMs={session.remainingMs} durationSec={duration} />
           </div>
         </div>
 
@@ -201,8 +196,7 @@ export default function Question({ code }) {
             const isCorrect = false;
             const isWrong = false;
             const isLockedOut = isAnswered && !isSelected;
-            const disabled =
-              !canAnswer || isAnswered || pendingAnswer || session.paused || connectionStatus !== 'connected';
+            const disabled = !canAnswer || isAnswered || pendingAnswer || connectionStatus !== 'connected';
 
             return (
               <button
@@ -370,19 +364,18 @@ export default function Question({ code }) {
   );
 }
 
-function LivePoints({ remainingMs, durationSec, paused }) {
+function LivePoints({ remainingMs, durationSec }) {
   const [tick, setTick] = useState(0);
   const [startedAt, setStartedAt] = useState(() => performance.now());
 
   useEffect(() => {
     setStartedAt(performance.now());
     setTick(0);
-    if (paused) return undefined;
     const id = setInterval(() => setTick((t) => t + 1), 100);
     return () => clearInterval(id);
-  }, [remainingMs, paused]);
+  }, [remainingMs]);
 
-  const elapsed = paused ? 0 : (performance.now() - startedAt) / 1000;
+  const elapsed = (performance.now() - startedAt) / 1000;
   const timeLeft = Math.max(0, remainingMs / 1000 - elapsed);
   const pts = projectedPoints(timeLeft, durationSec);
 

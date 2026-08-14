@@ -102,7 +102,12 @@ export default function Final() {
         clearPendingLeave();
       }
     } catch {
-      // Disconnect cleanup is the fallback; local state must still be cleared.
+      // Drive pending-leave recovery even when an acknowledgement times out
+      // without Socket.IO noticing a transport failure.
+      if (socket.connected) {
+        socket.disconnect();
+        socket.connect();
+      }
     } finally {
       reset();
       navigate('/');
