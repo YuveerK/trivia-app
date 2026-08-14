@@ -22,8 +22,22 @@ const allowedOrigins = new Set([
   'http://127.0.0.1:4173',
 ]);
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Vite picks the next free port when 5173 is taken, which would otherwise turn a
+// busy port into an opaque CORS failure. Production keeps the strict allowlist.
+function isLocalDevOrigin(origin) {
+  if (IS_PRODUCTION) return false;
+  try {
+    const { protocol, hostname } = new URL(origin);
+    return protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1');
+  } catch {
+    return false;
+  }
+}
+
 function allowOrigin(origin, callback) {
-  if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+  if (!origin || allowedOrigins.has(origin) || isLocalDevOrigin(origin)) return callback(null, true);
   return callback(new Error('Origin is not allowed by CORS.'));
 }
 
@@ -142,13 +156,16 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
     if (!output) return;
     if (output.ended) return endSession(code, output.reason ?? 'Session ended.');
     if (!output.session) return;
+    // A host who participated may have been the only unanswered player. Once
+    // they are reaped, finish the round immediately instead of restarting the
+    // clock and making everyone else wait through the remaining duration.
+    if (allPlayersAnswered(output.session)) return goToResults(code);
     if (output.hostChanged) return snapshot(code);
     if (output.removed) {
       delta(output.session, 'player:remove', { playerId: output.player?.id });
     } else if (output.player) {
       delta(output.session, 'player:upsert', { player: serializePlayer(output.session, output.player) });
     }
-    if (allPlayersAnswered(output.session)) goToResults(code);
   }
 
   sessions.onAfterPlayerChange = notifyPlayerChange;
@@ -195,7 +212,6 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
       result.you.id,
       result.you.reconnectToken,
       socket.id,
-      (session) => sessions.resumeRoundTimer(session, () => onRoundTimeout(session.code)),
     );
     if (!restored.ok) return restored;
 
@@ -261,7 +277,6 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
     socket.data.commandQueue = Promise.resolve();
 
     register(socket, 'host:create', async (payload) => {
-      await detachMembership(socket);
       const result = sessions.createSession(
         payload?.name,
         socket.id,
@@ -270,7 +285,15 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
       );
       if (!result.ok) return result;
       const session = result.session;
-      await attachMembership(socket, session, session.hostId, session.hostReconnectToken);
+      try {
+        // Only leave the current game after the replacement session has passed
+        // validation and exists. A rejected create must not eject the caller.
+        await detachMembership(socket);
+        await attachMembership(socket, session, session.hostId, session.hostReconnectToken);
+      } catch (error) {
+        sessions.cleanupSession(session.code);
+        throw error;
+      }
       return {
         ok: true,
         session: serializeSession(session),
@@ -287,11 +310,23 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
     register(socket, 'player:join', async (payload) => {
       const code = String(payload?.code ?? '').toUpperCase().trim();
       if (!/^[A-Z0-9]{4}$/.test(code)) return { ok: false, error: 'Enter a valid 4-character code.' };
-      await detachMembership(socket);
+      if (socket.data.membership?.code === code) {
+        return { ok: false, error: 'You are already in this session.' };
+      }
       const result = sessions.addPlayer(code, socket.id, payload?.name);
       if (!result.ok) return result;
       const { session, player } = result;
-      await attachMembership(socket, session, player.id, player.reconnectToken);
+      try {
+        // Adding validates the destination first. Do not sacrifice a healthy
+        // current membership for an invalid code, name, full room, or game that
+        // has already started.
+        await detachMembership(socket);
+        await attachMembership(socket, session, player.id, player.reconnectToken);
+      } catch (error) {
+        const rollback = sessions.removeParticipant(session.code, player.id, socket.id);
+        notifyPlayerChange(session.code, rollback);
+        throw error;
+      }
       delta(session, 'player:upsert', { player: serializePlayer(session, player) }, socket.to(code));
       return {
         ok: true,
@@ -313,7 +348,6 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
         payload?.playerId,
         payload?.reconnectToken,
         socket.id,
-        (session) => sessions.resumeRoundTimer(session, () => onRoundTimeout(code)),
       );
       if (!result.ok) return result;
       await attachMembership(socket, result.session, payload.playerId, payload.reconnectToken);
@@ -409,12 +443,7 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
     socket.on('disconnect', () => {
       const membership = socket.data.membership;
       if (!membership) return;
-      const hit = sessions.markDisconnected(
-        membership.code,
-        membership.playerId,
-        socket.id,
-        (code, { reason }) => endSession(code, reason),
-      );
+      const hit = sessions.markDisconnected(membership.code, membership.playerId, socket.id);
       if (!hit) return;
       if (hit.hostDisconnected) snapshot(hit.code);
       else if (hit.player) {

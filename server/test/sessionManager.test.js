@@ -66,27 +66,61 @@ test('rejects malformed answer indexes', () => {
   assert.equal(sessions.recordAnswer(session, 'player', 0, 999).ok, false);
 });
 
-test('freezes the authoritative clock while the host is disconnected', () => {
+test('keeps the authoritative clock running while the host is disconnected', () => {
   const sessions = manager();
   const session = sessions.createSession('Host', 'host', null, true).session;
   sessions.addPlayer(session.code, 'player', 'Player');
   sessions.startGame(session, () => {});
   session.roundStart = Date.now() - 5_000;
-  sessions.markDisconnected(session.code, session.hostId, 'host', () => {});
-  const frozen = getRemainingMs(session);
-  assert.equal(session.paused, true);
-  assert.equal(sessions.recordAnswer(session, 'player', 0, 0).ok, false);
-  session.roundElapsedMs += 10_000;
-  assert.equal(getRemainingMs(session), Math.max(0, frozen - 10_000));
+  const roundStart = session.roundStart;
+  const beforeDisconnect = getRemainingMs(session);
+  sessions.markDisconnected(session.code, session.hostId, 'host');
+  assert.equal(session.roundStart, roundStart);
+  assert.ok(getRemainingMs(session) <= beforeDisconnect);
+  assert.equal(sessions.recordAnswer(session, 'player', 0, 0).ok, true);
   const reconnect = sessions.markReconnected(
     session.code,
     session.hostId,
     session.hostReconnectToken,
     'new-host',
-    () => {},
   );
   assert.equal(reconnect.ok, true);
-  assert.equal(session.paused, false);
+});
+
+test('treats a same-socket spectator host reconnect as unchanged', () => {
+  const sessions = manager();
+  const session = sessions.createSession('Host', 'host', null, false).session;
+  const initialVersion = session.version;
+
+  const first = sessions.markReconnected(
+    session.code,
+    session.hostId,
+    session.hostReconnectToken,
+    'host',
+  );
+  const second = sessions.markReconnected(
+    session.code,
+    session.hostId,
+    session.hostReconnectToken,
+    'host',
+  );
+
+  assert.equal(first.unchanged, true);
+  assert.equal(second.unchanged, true);
+  assert.equal(session.version, initialVersion);
+});
+
+test('keeps an empty lobby alive while its spectator host is still connected', () => {
+  const sessions = manager();
+  const session = sessions.createSession('Host', 'host', null, false).session;
+  const player = sessions.addPlayer(session.code, 'player', 'Player').player;
+
+  const result = sessions.removeParticipant(session.code, player.id, 'player');
+
+  assert.equal(result.ended, undefined);
+  assert.equal(session.players.length, 0);
+  assert.equal(sessions.getSession(session.code), session);
+  assert.equal(sessions.addPlayer(session.code, 'replacement', 'Replacement').ok, true);
 });
 
 test('preserves scores and player identity when leaving after the lobby', () => {
@@ -109,11 +143,81 @@ test('keeps a disconnected player in the round until they leave or the round tim
   const two = sessions.addPlayer(session.code, 'two', 'Two').player;
   sessions.startGame(session, () => {});
   sessions.recordAnswer(session, 'one', 0, 0);
-  sessions.markDisconnected(session.code, two.id, 'two', () => {});
+  sessions.markDisconnected(session.code, two.id, 'two');
   assert.equal(allPlayersAnswered(session), false);
   sessions.removeParticipant(session.code, two.id, 'two');
   assert.equal(allPlayersAnswered(session), true);
   assert.equal(one.connected, true);
+});
+
+test('reaps a player who never returns so later rounds can still end early', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessions = manager();
+  const session = sessions.createSession('Host', 'host', null, false).session;
+  sessions.addPlayer(session.code, 'one', 'One');
+  const ghost = sessions.addPlayer(session.code, 'ghost', 'Ghost').player;
+  sessions.startGame(session, () => {});
+
+  sessions.markDisconnected(session.code, ghost.id, 'ghost');
+  sessions.recordAnswer(session, 'one', 0, 0);
+  assert.equal(allPlayersAnswered(session), false);
+
+  t.mock.timers.tick(60_000);
+  assert.equal(ghost.departed, true);
+  assert.equal(allPlayersAnswered(session), true);
+});
+
+test('hands the room to a connected player when the host never returns', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessions = manager();
+  let endedReason = null;
+  sessions.onAfterPlayerChange = (_code, output) => {
+    if (output.ended) endedReason = output.reason;
+  };
+  const session = sessions.createSession('Host', 'host', null, true).session;
+  const player = sessions.addPlayer(session.code, 'player', 'Player').player;
+  sessions.startGame(session, () => {});
+
+  sessions.markDisconnected(session.code, session.hostId, 'host');
+
+  t.mock.timers.tick(60_000);
+  assert.equal(endedReason, null);
+  assert.equal(session.hostId, player.id);
+  assert.equal(session.hostDisconnected, false);
+});
+
+test('an absent spectator host hands off rather than destroying the game', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessions = manager();
+  const session = sessions.createSession('Host', 'host', null, false).session;
+  const player = sessions.addPlayer(session.code, 'player', 'Player').player;
+  sessions.startGame(session, () => {});
+
+  sessions.markDisconnected(session.code, session.hostId, 'host');
+  t.mock.timers.tick(60_000);
+
+  assert.equal(sessions.getSession(session.code), session);
+  assert.equal(session.hostId, player.id);
+  assert.equal(session.hostParticipates, true);
+});
+
+test('still ends the session when nobody can take over as host', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sessions = manager();
+  let endedReason = null;
+  sessions.onAfterPlayerChange = (_code, output) => {
+    if (output.ended) endedReason = output.reason;
+  };
+  const session = sessions.createSession('Host', 'host', null, false).session;
+  const player = sessions.addPlayer(session.code, 'player', 'Player').player;
+  sessions.startGame(session, () => {});
+
+  sessions.markDisconnected(session.code, player.id, 'player');
+  sessions.markDisconnected(session.code, session.hostId, 'host');
+  t.mock.timers.tick(60_000);
+
+  assert.equal(endedReason, 'Everyone left the session.');
+  assert.equal(sessions.getSession(session.code), null);
 });
 
 test('does not reveal current-round score changes before results', () => {

@@ -5,7 +5,7 @@ import { Loader2, Play, LogOut, Trash2, Wifi, WifiOff } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
 import { PageShell } from '../components/PageShell.jsx';
 import { PlayerBadge, avatarGradient } from '../components/PlayerBadge.jsx';
-import { emitWithAck } from '../lib/socket.js';
+import { emitWithAck, socket } from '../lib/socket.js';
 import {
   clearPendingLeave,
   getPersistedSession,
@@ -52,6 +52,10 @@ export default function Lobby() {
       }
     } catch (error) {
       toast.error(error.message ?? 'The server could not confirm that you left.');
+      if (socket.connected) {
+        socket.disconnect();
+        socket.connect();
+      }
     } finally {
       reset();
       navigate('/');

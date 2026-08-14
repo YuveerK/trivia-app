@@ -139,7 +139,12 @@ function AppRoutes() {
     const onSnapshot = ({ session: nextSession }) => {
       const current = useGameStore.getState().session;
       if (current?.code === nextSession?.code && current.version > nextSession.version) return;
+      const promoted =
+        current?.code === nextSession?.code &&
+        current.hostId !== nextSession.hostId &&
+        nextSession.hostId === useGameStore.getState().me?.id;
       useGameStore.getState().setSession(nextSession);
+      if (promoted) toast('You are the host now — the previous host did not come back.');
     };
 
     const onDelta = (delta) => {
@@ -205,7 +210,15 @@ function AppRoutes() {
         await emitWithAck('player:leave', { code: current.code }, { attempts: 1, timeout: 2_000 });
         clearPendingLeave();
       }
-      catch { /* Disconnect cleanup remains the fallback. */ }
+      catch {
+        // If an acknowledgement fails while the transport still looks alive,
+        // force a fresh connection so the persisted pending leave is processed
+        // instead of leaving a permanently attached ghost on the server.
+        if (socket.connected) {
+          socket.disconnect();
+          socket.connect();
+        }
+      }
     }
     reset();
     navigate('/');

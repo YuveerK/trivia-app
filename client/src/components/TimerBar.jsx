@@ -4,13 +4,12 @@ import { cn } from '../lib/utils.js';
 const RADIUS = 44;
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
-export function TimerBar({ remainingMs, durationSec, paused = false }) {
+export function TimerBar({ remainingMs, durationSec }) {
   const [timeLeft, setTimeLeft] = useState(Math.max(0, remainingMs / 1000));
 
   useEffect(() => {
     const initial = Math.max(0, remainingMs / 1000);
     setTimeLeft(initial);
-    if (paused) return undefined;
     const startedAt = performance.now();
     const tick = () => {
       const elapsed = (performance.now() - startedAt) / 1000;
@@ -18,7 +17,7 @@ export function TimerBar({ remainingMs, durationSec, paused = false }) {
     };
     const id = setInterval(tick, 100);
     return () => clearInterval(id);
-  }, [remainingMs, paused]);
+  }, [remainingMs]);
 
   const pct = durationSec > 0 ? Math.min(100, (timeLeft / durationSec) * 100) : 0;
   const strokeDashoffset = CIRCUMFERENCE * (1 - pct / 100);

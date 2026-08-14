@@ -100,7 +100,9 @@ export default function Play() {
           <div>
             <p className="text-sm font-bold text-amber-900 dark:text-amber-100">Host disconnected</p>
             <p className="mt-0.5 text-xs text-amber-700 dark:text-amber-300">
-              Waiting for them to return. The round timer is paused.
+              {session.phase === 'question'
+                ? 'Waiting for them to return. The server timer is still running.'
+                : 'Waiting for them to return or for host control to be transferred.'}
             </p>
           </div>
         </div>
