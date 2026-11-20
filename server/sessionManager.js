@@ -73,10 +73,13 @@ function createPlayer(baseName, name, socketId, id = randomUUID(), reconnectToke
     name,
     score: 0,
     answers: {},
+    caught: {},
     connected: true,
     departed: false,
   };
 }
+
+export const CAUGHT_REASONS = new Set(['tab', 'copy']);
 
 function shuffleQuestionOptions(question) {
   const options = question.options.map((option, index) => ({ option, originalIndex: index }));
@@ -130,6 +133,7 @@ export function serializePlayer(session, player) {
     name: player.name,
     score: Math.max(0, player.score - hiddenCurrentPoints),
     answers: serializeAnswers(session, player.answers),
+    caught: { ...(player.caught ?? {}) },
     connected: player.connected,
     departed: player.departed,
   };
@@ -549,6 +553,31 @@ export class SessionManager {
     if (correct) player.score += points;
     this.touch(session);
     return { ok: true, player, correct, points };
+  }
+
+  /**
+   * Records a playful "caught wandering" flag: the player hid the game tab or
+   * copied the question before answering. It is shown to everyone for fun and
+   * never affects scores. Ignored for the host (who switches windows to share
+   * their screen), after the player answered, and when already flagged this round.
+   */
+  recordCaught(session, socketId, roundIndex, reason) {
+    if (session.phase !== 'question') return { ok: false, error: 'Not in question phase.' };
+    if (!Number.isInteger(roundIndex) || roundIndex !== session.currentRound) {
+      return { ok: false, error: 'Wrong round.' };
+    }
+    if (!CAUGHT_REASONS.has(reason)) return { ok: false, error: 'Invalid reason.' };
+    const player = session.players.find(
+      (item) => item.socketId === socketId && item.connected && !item.departed,
+    );
+    if (!player) return { ok: false, error: 'Player not in session.' };
+    player.caught ??= {};
+    if (player.id === session.hostId || player.answers[roundIndex] || player.caught[roundIndex]) {
+      return { ok: true, ignored: true };
+    }
+    player.caught[roundIndex] = reason;
+    this.touch(session);
+    return { ok: true, ignored: false, player };
   }
 
   transitionToResults(session) {

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import toast from 'react-hot-toast';
 import { CheckCircle2, XCircle, ChevronRight, Flag } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
+import { CaughtBanner } from '../components/CaughtBanner.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
 import { emitWithAck } from '../lib/socket.js';
 import { useGameStore } from '../lib/store.js';
@@ -173,13 +174,15 @@ export default function Results({ code }) {
         </div>
       </div>
 
+      <CaughtBanner players={session.players} round={round} title="Wall of Shame" />
+
       {/* Leaderboard */}
       <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-stage">
         <div className="border-b border-border px-5 py-3.5">
           <h3 className="font-bold text-foreground">Standings after round {round + 1}</h3>
         </div>
         <div className="p-2">
-          <Leaderboard players={session.players} currentPlayerId={me?.id} />
+          <Leaderboard players={session.players} currentPlayerId={me?.id} caughtRound={round} />
         </div>
       </div>
 

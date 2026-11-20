@@ -10,6 +10,7 @@ import {
   queuePendingLeave,
   useGameStore,
 } from '../lib/store.js';
+import { caughtTotals } from '../lib/caught.js';
 import { cn } from '../lib/utils.js';
 import { emitWithAck, socket } from '../lib/socket.js';
 
@@ -251,10 +252,52 @@ export default function Final() {
         </ul>
       </div>
 
+      <MostCurious players={session.players} meId={me?.id} />
+
       <Button onClick={newGame} className="gap-2 text-base" disabled={leaving}>
         <RotateCcw className="size-5" aria-hidden />
         Play again
       </Button>
     </PageShell>
+  );
+}
+
+const timesLabel = (count) => (count === 1 ? 'once' : `${count} times`);
+
+function MostCurious({ players, meId }) {
+  const totals = caughtTotals(players);
+  if (totals.length === 0) return null;
+  const topCount = totals[0].count;
+  const winners = totals.filter((entry) => entry.count === topCount);
+  const others = totals.filter((entry) => entry.count < topCount);
+
+  return (
+    <div className="animate-slideUp delay-300 overflow-hidden rounded-2xl border border-amber-300/60 bg-amber-50 shadow-stage dark:border-amber-500/30 dark:bg-amber-950/30">
+      <div className="px-5 py-5 text-center">
+        <div className="text-4xl leading-none" aria-hidden>🕵️</div>
+        <p className="mt-2 text-xs font-bold uppercase tracking-[0.18em] text-amber-700 dark:text-amber-300">
+          Most Curious Award
+        </p>
+        <p className="mt-1 text-xl font-extrabold text-amber-950 dark:text-amber-100">
+          {winners.map(({ player }) => player.name).join(' & ')}
+        </p>
+        <p className="mt-1 text-sm text-amber-800 dark:text-amber-200/80">
+          Wandered off {timesLabel(topCount)}. Google sends its regards.
+        </p>
+      </div>
+      {others.length > 0 && (
+        <ul className="divide-y divide-amber-200/60 border-t border-amber-300/50 dark:divide-amber-500/10 dark:border-amber-500/20">
+          {others.map(({ player, count }) => (
+            <li key={player.id} className="flex items-center justify-between gap-3 px-5 py-2.5 text-sm">
+              <span className="truncate font-semibold text-amber-950 dark:text-amber-100">
+                👀 {player.name}
+                {player.id === meId && <span className="ml-1 text-xs font-normal opacity-70">(you)</span>}
+              </span>
+              <span className="shrink-0 text-xs font-bold text-amber-800 dark:text-amber-300">{timesLabel(count)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }

@@ -245,3 +245,45 @@ test('expires sessions by inactivity and invokes the notification callback', () 
   assert.equal(expiredCode, session.code);
   assert.equal(sessions.getSession(session.code), null);
 });
+
+test('records a playful caught flag once per round, only before answering, never for the host', () => {
+  const sessions = manager();
+  const session = sessions.createSession('Host', 'host', null, true).session;
+  const alex = sessions.addPlayer(session.code, 'alex', 'Alex').player;
+  const sam = sessions.addPlayer(session.code, 'sam', 'Sam').player;
+
+  assert.equal(sessions.recordCaught(session, 'alex', 0, 'tab').ok, false, 'lobby is ignored');
+  sessions.startGame(session, () => {});
+  const versionBefore = session.version;
+
+  const first = sessions.recordCaught(session, 'alex', 0, 'tab');
+  assert.equal(first.ok, true);
+  assert.equal(first.ignored, false);
+  assert.deepEqual(alex.caught, { 0: 'tab' });
+  assert.equal(session.version, versionBefore + 1);
+
+  const repeat = sessions.recordCaught(session, 'alex', 0, 'copy');
+  assert.equal(repeat.ignored, true);
+  assert.deepEqual(alex.caught, { 0: 'tab' }, 'first reason wins');
+  assert.equal(session.version, versionBefore + 1);
+
+  assert.equal(sessions.recordCaught(session, 'host', 0, 'tab').ignored, true, 'host is never flagged');
+  assert.deepEqual(session.players.find((p) => p.id === session.hostId).caught, {});
+
+  assert.equal(sessions.recordAnswer(session, 'sam', 0, 0).ok, true);
+  assert.equal(sessions.recordCaught(session, 'sam', 0, 'tab').ignored, true, 'after answering is fine');
+  assert.deepEqual(sam.caught, {});
+
+  assert.equal(sessions.recordCaught(session, 'alex', 1, 'tab').ok, false, 'future round rejected');
+  assert.equal(sessions.recordCaught(session, 'alex', 0, 'hacker').ok, false, 'unknown reason rejected');
+  assert.equal(sessions.recordCaught(session, 'stranger', 0, 'tab').ok, false);
+
+  sessions.transitionToResults(session);
+  assert.equal(sessions.recordCaught(session, 'sam', 0, 'tab').ok, false, 'results phase rejected');
+  sessions.nextRound(session, () => {});
+  assert.equal(sessions.recordCaught(session, 'alex', 1, 'copy').ignored, false);
+  assert.deepEqual(alex.caught, { 0: 'tab', 1: 'copy' });
+
+  assert.deepEqual(serializePlayer(session, alex).caught, { 0: 'tab', 1: 'copy' });
+  assert.equal(alex.score, 0, 'scores are untouched');
+});
