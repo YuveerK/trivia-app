@@ -1,13 +1,16 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import toast from 'react-hot-toast';
 import { CheckCircle2, XCircle, Eye, ChevronDown } from 'lucide-react';
 import { Button } from '../components/Button.jsx';
+import { CaughtBanner } from '../components/CaughtBanner.jsx';
 import { Leaderboard } from '../components/Leaderboard.jsx';
 import { TimerBar } from '../components/TimerBar.jsx';
+import { caughtInRound, caughtLine } from '../lib/caught.js';
 import { projectedPoints } from '../lib/scoring.js';
 import { resolveLockedAnswerIndex } from '../lib/answerState.js';
 import { emitWithAck } from '../lib/socket.js';
 import { useGameStore } from '../lib/store.js';
+import { useCaughtDetector } from '../lib/useCaughtDetector.js';
 import { cn } from '../lib/utils.js';
 
 const LETTER = (i) => String.fromCharCode(65 + i);
@@ -82,6 +85,30 @@ export default function Question({ code }) {
   const canAnswer = Boolean(myPlayer);
   const myAnswer = myPlayer?.answers?.[round];
   const lockedIdx = resolveLockedAnswerIndex(canAnswer, myAnswer, selectedAnswer);
+  const isHostViewer = me?.id === session?.hostId;
+
+  useCaughtDetector({
+    code,
+    round,
+    active: Boolean(q) && canAnswer && !isHostViewer && lockedIdx == null && !pendingAnswer,
+  });
+
+  // Pop a toast on the (screen-shared) host view for each newly caught player.
+  const announcedCaught = useRef(null);
+  useEffect(() => {
+    if (!isHostViewer) return;
+    const caught = caughtInRound(session?.players, round);
+    if (announcedCaught.current?.round !== round) {
+      // Don't replay earlier catches after a reload or reconnect.
+      announcedCaught.current = { round, ids: new Set(caught.map(({ player }) => player.id)) };
+      return;
+    }
+    for (const { player, reason } of caught) {
+      if (announcedCaught.current.ids.has(player.id)) continue;
+      announcedCaught.current.ids.add(player.id);
+      toast(caughtLine(player.name, round, reason), { icon: '🚨', duration: 5_000 });
+    }
+  }, [isHostViewer, session?.players, round]);
 
   useEffect(() => {
     setLastFeedback(null);
@@ -288,6 +315,8 @@ export default function Question({ code }) {
         )}
       </div>
 
+      <CaughtBanner players={session.players} round={round} />
+
       {isHost && (
         <Button
           variant="outline"
@@ -337,6 +366,7 @@ export default function Question({ code }) {
               players={session.players}
               currentPlayerId={me?.id}
               currentRound={round}
+              caughtRound={round}
               showAnswerStatus
               className="max-h-72 overflow-y-auto"
             />
@@ -356,6 +386,7 @@ export default function Question({ code }) {
             players={session.players}
             currentPlayerId={me?.id}
             currentRound={round}
+            caughtRound={round}
             showAnswerStatus
           />
         </div>

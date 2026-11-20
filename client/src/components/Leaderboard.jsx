@@ -8,7 +8,7 @@ const MEDAL_RINGS = [
   'ring-2 ring-amber-600/50 dark:ring-amber-700/50',
 ];
 
-export function Leaderboard({ players, currentPlayerId, className = '', currentRound = null, showAnswerStatus = false }) {
+export function Leaderboard({ players, currentPlayerId, className = '', currentRound = null, showAnswerStatus = false, caughtRound = null }) {
   const sorted = [...players].sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     return a.name.localeCompare(b.name);
@@ -27,6 +27,7 @@ export function Leaderboard({ players, currentPlayerId, className = '', currentR
           const gradient = avatarGradient(player.name);
           const scorePct = maxScore > 0 ? Math.round((player.score / maxScore) * 100) : 0;
           const answered = showAnswerStatus && currentRound != null && player.answers?.[currentRound];
+          const caught = caughtRound != null && player.caught?.[caughtRound];
 
           return (
             <li
@@ -69,6 +70,11 @@ export function Leaderboard({ players, currentPlayerId, className = '', currentR
                   <span className={cn('truncate text-sm font-semibold', isYou ? 'text-primary' : 'text-foreground')}>
                     {player.name}
                     {isYou && <span className="ml-1 text-xs font-normal text-muted-foreground">(you)</span>}
+                    {caught && (
+                      <span className="ml-1.5" role="img" aria-label="Caught wandering" title="Caught wandering">
+                        👀
+                      </span>
+                    )}
                   </span>
                   <div className="flex shrink-0 items-center gap-2">
                     {showAnswerStatus && currentRound != null && (

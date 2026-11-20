@@ -349,3 +349,42 @@ test('host handoff immediately finishes a round when every remaining player answ
   assert.equal(snapshot.session.hostId, joined.you.id);
   assert.equal(snapshot.session.phase, 'results');
 });
+
+test('a caught flag is broadcast to the host screen once and ignored after answering', async () => {
+  const trivia = createTriviaServer();
+  const address = await trivia.listen(0);
+  const url = `http://127.0.0.1:${address.port}`;
+  const sockets = [];
+  test.after(async () => {
+    for (const socket of sockets) socket.disconnect();
+    await trivia.close();
+  });
+
+  const host = await connect(url); sockets.push(host);
+  const created = await request(host, 'host:create', { name: 'Host', hostParticipates: false });
+  const code = created.session.code;
+  const one = await connect(url); sockets.push(one);
+  const two = await connect(url); sockets.push(two);
+  const joinedOne = await request(one, 'player:join', { code, name: 'Alex' });
+  await request(two, 'player:join', { code, name: 'Sam' });
+
+  assert.equal((await request(one, 'player:caught', { code, roundIndex: 0, reason: 'tab' })).ok, false);
+  await request(host, 'host:start', { code });
+
+  const callout = waitFor(host, 'session:delta', ({ type, payload }) =>
+    type === 'player:upsert' && payload.player.id === joinedOne.you.id && payload.player.caught?.[0],
+  );
+  const caught = await request(one, 'player:caught', { code, roundIndex: 0, reason: 'tab' });
+  assert.deepEqual(caught, { ok: true, recorded: true });
+  assert.deepEqual((await callout).payload.player.caught, { 0: 'tab' });
+
+  const again = await request(one, 'player:caught', { code, roundIndex: 0, reason: 'copy' });
+  assert.deepEqual(again, { ok: true, recorded: false });
+
+  await request(two, 'player:answer', { code, roundIndex: 0, optionIndex: 0 });
+  const afterAnswer = await request(two, 'player:caught', { code, roundIndex: 0, reason: 'tab' });
+  assert.deepEqual(afterAnswer, { ok: true, recorded: false });
+
+  const stranger = await connect(url); sockets.push(stranger);
+  assert.equal((await request(stranger, 'player:caught', { code, roundIndex: 0, reason: 'tab' })).ok, false);
+});

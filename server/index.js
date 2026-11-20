@@ -421,6 +421,20 @@ export function createTriviaServer({ sessions = new SessionManager() } = {}) {
       return { ok: true, accepted: true };
     });
 
+    register(socket, 'player:caught', async (payload) => {
+      const code = String(payload?.code ?? '').toUpperCase();
+      const membership = socket.data.membership;
+      if (!membership || membership.code !== code) return { ok: false, error: 'Not in this session.' };
+      const session = sessions.getSession(code);
+      if (!session) return { ok: false, error: 'Session not found.' };
+      const result = sessions.recordCaught(session, socket.id, payload?.roundIndex, payload?.reason);
+      if (!result.ok) return result;
+      if (!result.ignored) {
+        delta(session, 'player:upsert', { player: serializePlayer(session, result.player) });
+      }
+      return { ok: true, recorded: !result.ignored };
+    });
+
     register(socket, 'player:leave', async () => {
       const membership = socket.data.membership;
       if (!membership) return { ok: true };
